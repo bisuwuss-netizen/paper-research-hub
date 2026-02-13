@@ -1,0 +1,538 @@
+import axios from "axios";
+
+const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
+
+export type Paper = {
+  id: number;
+  title?: string | null;
+  authors?: string | null;
+  year?: number | null;
+  journal_conf?: string | null;
+  ccf_level?: string | null;
+  source_type?: string | null;
+  sub_field?: string | null;
+  read_status?: number | null;
+  file_path?: string | null;
+  doi?: string | null;
+  abstract?: string | null;
+  s2_paper_id?: string | null;
+  s2_corpus_id?: string | null;
+  citation_count?: number | null;
+  reference_count?: number | null;
+  influential_citation_count?: number | null;
+  citation_velocity?: number | null;
+  url?: string | null;
+  venue?: string | null;
+  keywords?: string | null;
+  cluster_id?: string | null;
+  zotero_item_key?: string | null;
+  zotero_library?: string | null;
+  zotero_item_id?: number | null;
+  summary_one?: string | null;
+  created_at?: number | null;
+  updated_at?: number | null;
+};
+
+export type GraphNode = {
+  id: number;
+  label: string;
+  size: number;
+  color: string;
+  year?: number | null;
+  authors?: string | null;
+  abstract?: string | null;
+  sub_field?: string | null;
+  read_status?: number | null;
+  ccf_level?: string | null;
+  source_type?: string | null;
+  citation_count?: number | null;
+  reference_count?: number | null;
+  pagerank?: number | null;
+  citation_velocity?: number | null;
+  doi?: string | null;
+  url?: string | null;
+  zotero_item_key?: string | null;
+  zotero_library?: string | null;
+  zotero_item_id?: number | null;
+  summary_one?: string | null;
+  open_tasks?: number | null;
+  overdue_tasks?: number | null;
+  experiment_count?: number | null;
+};
+
+export type GraphEdge = {
+  id: string;
+  source: number;
+  target: number;
+  confidence?: number;
+  edge_source?: string | null;
+};
+
+export type GraphResponse = {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  meta: {
+    sub_fields: string[];
+    year_min: number | null;
+    year_max: number | null;
+    year_counts: { year: number; count: number }[];
+    year_min_all?: number | null;
+    year_max_all?: number | null;
+    year_counts_all?: { year: number; count: number }[];
+    total_nodes?: number;
+    limit?: number | null;
+    offset?: number | null;
+    size_by?: string;
+  };
+};
+
+export type GraphMiniResponse = {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+};
+
+export type Subfield = {
+  id: number;
+  name: string;
+  description?: string | null;
+  active?: number;
+};
+
+export type SyncStatus = Record<string, number>;
+
+export type PaperNote = {
+  paper_id: number;
+  method?: string | null;
+  datasets?: string | null;
+  conclusions?: string | null;
+  reproducibility?: string | null;
+  risks?: string | null;
+  notes?: string | null;
+  created_at?: number | null;
+  updated_at?: number | null;
+};
+
+export type ReadingTask = {
+  id: number;
+  paper_id: number;
+  title: string;
+  status: string;
+  priority: number;
+  due_date?: string | null;
+  next_review_at?: number | null;
+  interval_days?: number | null;
+  last_review_at?: number | null;
+};
+
+export type Experiment = {
+  id: number;
+  paper_id: number;
+  name?: string | null;
+  model?: string | null;
+  params_json?: string | null;
+  metrics_json?: string | null;
+  result_summary?: string | null;
+  artifact_path?: string | null;
+  created_at?: number | null;
+  updated_at?: number | null;
+};
+
+export type SearchResult = {
+  paper: Paper;
+  score: number;
+  bm25_score: number;
+  semantic_score: number;
+  snippet?: string;
+};
+
+export type TopicEvolution = {
+  trends: Array<{
+    year: number;
+    total: number;
+    sub_fields: Record<string, number>;
+  }>;
+  hotspots: Array<{
+    year: number;
+    papers: Array<{
+      id: number;
+      title?: string;
+      sub_field?: string;
+      velocity: number;
+      citation_count: number;
+    }>;
+  }>;
+  bursts: Array<{
+    sub_field: string;
+    year: number;
+    count: number;
+    growth: number;
+    growth_ratio: number;
+  }>;
+};
+
+export type Report = {
+  id: number;
+  period_type: "weekly" | "monthly";
+  period_start: string;
+  period_end: string;
+  payload_json?: string;
+  payload?: Record<string, any>;
+  created_at: number;
+};
+
+export type ZoteroMappingTemplate = {
+  id?: number;
+  name: string;
+  mapping: Record<string, string>;
+  mapping_json?: string;
+  created_at?: number;
+  updated_at?: number;
+};
+
+export type ZoteroSyncLog = {
+  id: number;
+  paper_id?: number | null;
+  direction?: string | null;
+  action?: string | null;
+  status?: string | null;
+  conflict_strategy?: string | null;
+  details?: Record<string, any>;
+  created_at?: number | null;
+};
+
+export async function fetchNeighbors(params: {
+  node_id: number;
+  depth?: number;
+  limit?: number;
+}): Promise<GraphMiniResponse> {
+  const res = await axios.get(`${API_BASE}/api/graph/neighbors`, { params });
+  return res.data;
+}
+
+export async function fetchSubfields(active_only = true): Promise<Subfield[]> {
+  const res = await axios.get(`${API_BASE}/api/subfields`, { params: { active_only } });
+  return res.data;
+}
+
+export async function createSubfield(payload: {
+  name: string;
+  description?: string;
+  active?: number;
+}): Promise<Subfield> {
+  const res = await axios.post(`${API_BASE}/api/subfields`, payload);
+  return res.data;
+}
+
+export async function updateSubfield(
+  id: number,
+  payload: Partial<{ name: string; description: string; active: number }>
+): Promise<Subfield> {
+  const res = await axios.patch(`${API_BASE}/api/subfields/${id}`, payload);
+  return res.data;
+}
+
+export async function deleteSubfield(id: number): Promise<void> {
+  await axios.delete(`${API_BASE}/api/subfields/${id}`);
+}
+
+export type RecommendationResponse = {
+  strategy: "foundation" | "sota" | "cluster";
+  highlight_nodes?: number[];
+  clusters?: Record<string, string>;
+};
+
+export type PathExportResponse = {
+  strategy: "foundation" | "sota";
+  path: {
+    id: number;
+    title?: string | null;
+    authors?: string | null;
+    year?: number | null;
+    venue?: string | null;
+    doi?: string | null;
+    url?: string | null;
+  }[];
+};
+
+export async function fetchPapers(): Promise<Paper[]> {
+  const res = await axios.get(`${API_BASE}/api/papers`);
+  return res.data;
+}
+
+export async function uploadPaper(file: File): Promise<Paper> {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await axios.post(`${API_BASE}/api/papers/upload`, form, {
+    headers: { "Content-Type": "multipart/form-data" }
+  });
+  return res.data;
+}
+
+export async function fetchGraph(params?: {
+  sub_field?: string;
+  year_from?: number;
+  year_to?: number;
+  size_by?: "citations" | "pagerank";
+  edge_recent_years?: number;
+  min_indegree?: number;
+  limit?: number;
+  offset?: number;
+  sort_by?: "citation_count" | "year" | "pagerank";
+  uploaded_only?: boolean;
+  edge_min_confidence?: number;
+}): Promise<GraphResponse> {
+  const res = await axios.get(`${API_BASE}/api/graph`, { params });
+  return res.data;
+}
+
+export async function fetchRecommendations(params: {
+  strategy: "foundation" | "sota" | "cluster";
+  sub_field?: string;
+  year_from?: number;
+  year_to?: number;
+}): Promise<RecommendationResponse> {
+  const res = await axios.get(`${API_BASE}/api/recommendations`, { params });
+  return res.data;
+}
+
+export async function exportPath(params: {
+  strategy: "foundation" | "sota";
+  sub_field?: string;
+  year_from?: number;
+  year_to?: number;
+}): Promise<PathExportResponse> {
+  const res = await axios.get(`${API_BASE}/api/recommendations/path`, { params });
+  return res.data;
+}
+
+export async function updatePaper(
+  id: number,
+  payload: Partial<
+    Pick<
+      Paper,
+      "read_status" | "zotero_item_key" | "zotero_library" | "zotero_item_id" | "sub_field"
+    >
+  >
+): Promise<Paper> {
+  const res = await axios.patch(`${API_BASE}/api/papers/${id}`, payload);
+  return res.data;
+}
+
+export async function matchZotero(id: number): Promise<Paper> {
+  const res = await axios.post(`${API_BASE}/api/papers/${id}/zotero-match`);
+  return res.data;
+}
+
+export async function pushZotero(id: number): Promise<void> {
+  await axios.post(`${API_BASE}/api/zotero/push/${id}`);
+}
+
+export async function zoteroMatchAll(limit = 20): Promise<{ matched: number }> {
+  const res = await axios.post(`${API_BASE}/api/zotero/match-all`, null, { params: { limit } });
+  return res.data;
+}
+
+export async function zoteroPushAll(limit = 20): Promise<{ updated: number }> {
+  const res = await axios.post(`${API_BASE}/api/zotero/push-all`, null, { params: { limit } });
+  return res.data;
+}
+
+export async function zoteroSyncIds(limit = 50): Promise<{ synced: number }> {
+  const res = await axios.post(`${API_BASE}/api/zotero/sync-ids`, null, { params: { limit } });
+  return res.data;
+}
+
+export async function fetchSyncStatus(): Promise<SyncStatus> {
+  const res = await axios.get(`${API_BASE}/api/sync/status`);
+  return res.data;
+}
+
+export async function enqueueAllSync(): Promise<{ enqueued: number }> {
+  const res = await axios.post(`${API_BASE}/api/sync/enqueue-all`);
+  return res.data;
+}
+
+export async function runSync(limit = 5): Promise<{ processed: number; failed: number }> {
+  const res = await axios.post(`${API_BASE}/api/sync/run`, null, { params: { limit } });
+  return res.data;
+}
+
+export async function cleanupCitations(): Promise<{ removed: number }> {
+  const res = await axios.post(`${API_BASE}/api/maintenance/cleanup`);
+  return res.data;
+}
+
+export async function backfillPapers(params?: {
+  limit?: number;
+  summary?: boolean;
+  references?: boolean;
+  force?: boolean;
+}): Promise<{ processed: number; summary_added: number; references_parsed: number }> {
+  const res = await axios.post(`${API_BASE}/api/papers/backfill`, null, { params });
+  return res.data;
+}
+
+export async function searchPapers(
+  q: string,
+  top_k = 20
+): Promise<{ query: string; results: SearchResult[]; fallback?: boolean }> {
+  const res = await axios.get(`${API_BASE}/api/search`, { params: { q, top_k } });
+  return res.data;
+}
+
+export async function fetchPaperNotes(paperId: number): Promise<PaperNote> {
+  const res = await axios.get(`${API_BASE}/api/papers/${paperId}/notes`);
+  return res.data;
+}
+
+export async function savePaperNotes(
+  paperId: number,
+  payload: Partial<Omit<PaperNote, "paper_id">>
+): Promise<PaperNote> {
+  const res = await axios.put(`${API_BASE}/api/papers/${paperId}/notes`, payload);
+  return res.data;
+}
+
+export async function fetchTasks(params?: {
+  paper_id?: number;
+  status?: string;
+}): Promise<ReadingTask[]> {
+  const res = await axios.get(`${API_BASE}/api/tasks`, { params });
+  return res.data;
+}
+
+export async function createTask(payload: {
+  paper_id: number;
+  title: string;
+  priority?: number;
+  due_date?: string;
+  next_review_at?: number;
+  interval_days?: number;
+}): Promise<ReadingTask> {
+  const res = await axios.post(`${API_BASE}/api/tasks`, payload);
+  return res.data;
+}
+
+export async function updateTask(
+  taskId: number,
+  payload: Partial<Pick<ReadingTask, "title" | "status" | "priority" | "due_date" | "next_review_at" | "interval_days">>
+): Promise<ReadingTask> {
+  const res = await axios.patch(`${API_BASE}/api/tasks/${taskId}`, payload);
+  return res.data;
+}
+
+export async function completeReview(taskId: number): Promise<ReadingTask> {
+  const res = await axios.post(`${API_BASE}/api/tasks/${taskId}/complete-review`);
+  return res.data;
+}
+
+export async function fetchExperiments(params?: { paper_id?: number }): Promise<Experiment[]> {
+  const res = await axios.get(`${API_BASE}/api/experiments`, { params });
+  return res.data;
+}
+
+export async function createExperiment(payload: {
+  paper_id: number;
+  name?: string;
+  model?: string;
+  params_json?: string;
+  metrics_json?: string;
+  result_summary?: string;
+  artifact_path?: string;
+}): Promise<Experiment> {
+  const res = await axios.post(`${API_BASE}/api/experiments`, payload);
+  return res.data;
+}
+
+export async function updateExperiment(
+  experimentId: number,
+  payload: Partial<Pick<Experiment, "name" | "model" | "params_json" | "metrics_json" | "result_summary" | "artifact_path">>
+): Promise<Experiment> {
+  const res = await axios.patch(`${API_BASE}/api/experiments/${experimentId}`, payload);
+  return res.data;
+}
+
+export async function deleteExperiment(experimentId: number): Promise<void> {
+  await axios.delete(`${API_BASE}/api/experiments/${experimentId}`);
+}
+
+export async function fetchDuplicateGroups(params?: {
+  title_threshold?: number;
+}): Promise<{ groups: Array<{ type: string; key: string; paper_ids: number[]; confidence: number }>; count: number }> {
+  const res = await axios.get(`${API_BASE}/api/quality/duplicates`, { params });
+  return res.data;
+}
+
+export async function fetchConflicts(): Promise<{
+  conflicts: Array<{
+    doi: string;
+    paper_ids: number[];
+    title_variants: string[];
+    year_variants: number[];
+  }>;
+  count: number;
+}> {
+  const res = await axios.get(`${API_BASE}/api/quality/conflicts`);
+  return res.data;
+}
+
+export async function mergePapers(payload: {
+  source_paper_id: number;
+  target_paper_id: number;
+}): Promise<{ status: string; source: number; target: number }> {
+  const res = await axios.post(`${API_BASE}/api/quality/merge`, payload);
+  return res.data;
+}
+
+export async function autoMerge(params?: {
+  limit?: number;
+  title_threshold?: number;
+}): Promise<{ merged: number }> {
+  const res = await axios.post(`${API_BASE}/api/quality/auto-merge`, null, { params });
+  return res.data;
+}
+
+export async function fetchTopicEvolution(): Promise<TopicEvolution> {
+  const res = await axios.get(`${API_BASE}/api/analytics/topic-evolution`);
+  return res.data;
+}
+
+export async function generateReport(period: "weekly" | "monthly"): Promise<Report> {
+  const res = await axios.post(`${API_BASE}/api/reports/generate`, null, { params: { period } });
+  return res.data;
+}
+
+export async function fetchReports(params?: {
+  period?: "weekly" | "monthly";
+  limit?: number;
+}): Promise<Report[]> {
+  const res = await axios.get(`${API_BASE}/api/reports`, { params });
+  return res.data;
+}
+
+export async function fetchZoteroTemplate(name = "default"): Promise<ZoteroMappingTemplate> {
+  const res = await axios.get(`${API_BASE}/api/zotero/mapping-template`, { params: { name } });
+  return res.data;
+}
+
+export async function saveZoteroTemplate(payload: {
+  name: string;
+  mapping: Record<string, string>;
+}): Promise<ZoteroMappingTemplate> {
+  const res = await axios.put(`${API_BASE}/api/zotero/mapping-template`, payload);
+  return res.data;
+}
+
+export async function fetchZoteroLogs(limit = 100): Promise<ZoteroSyncLog[]> {
+  const res = await axios.get(`${API_BASE}/api/zotero/sync-logs`, { params: { limit } });
+  return res.data;
+}
+
+export async function syncZoteroIncremental(payload: {
+  direction: "both" | "pull" | "push";
+  conflict_strategy: "prefer_local" | "prefer_zotero" | "manual";
+  limit?: number;
+}): Promise<{ synced: number; conflicts: number }> {
+  const res = await axios.post(`${API_BASE}/api/zotero/sync-incremental`, payload);
+  return res.data;
+}
