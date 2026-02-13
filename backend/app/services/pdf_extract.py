@@ -6,6 +6,16 @@ from typing import Optional, List, Dict, Any
 
 import fitz  # PyMuPDF
 
+try:
+    import pymupdf4llm  # type: ignore
+except Exception:
+    pymupdf4llm = None
+
+try:
+    import pdfplumber  # type: ignore
+except Exception:
+    pdfplumber = None
+
 
 @dataclass
 class ExtractedMetadata:
@@ -175,6 +185,42 @@ def extract_full_text(pdf_path: str, max_pages: Optional[int] = None) -> str:
     except Exception:
         return ""
     return "\n".join(texts)
+
+
+def extract_markdown(pdf_path: str, max_pages: Optional[int] = None) -> str:
+    if pymupdf4llm is None:
+        return ""
+    try:
+        if max_pages is not None:
+            pages = list(range(max_pages))
+            output = pymupdf4llm.to_markdown(pdf_path, pages=pages)
+        else:
+            output = pymupdf4llm.to_markdown(pdf_path)
+    except Exception:
+        return ""
+    if not isinstance(output, str):
+        return ""
+    return output
+
+
+def extract_tables_text(pdf_path: str, max_pages: Optional[int] = None) -> str:
+    if pdfplumber is None:
+        return ""
+    rows: List[str] = []
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            page_count = len(pdf.pages) if max_pages is None else min(max_pages, len(pdf.pages))
+            for i in range(page_count):
+                page = pdf.pages[i]
+                for table in page.extract_tables() or []:
+                    for row in table or []:
+                        cells = [re.sub(r"\s+", " ", str(cell or "")).strip() for cell in row]
+                        line = " | ".join([cell for cell in cells if cell])
+                        if line:
+                            rows.append(line)
+    except Exception:
+        return ""
+    return "\n".join(rows)
 
 
 def chunk_text(text: str, chunk_size: int = 900, overlap: int = 160) -> List[Dict[str, Any]]:

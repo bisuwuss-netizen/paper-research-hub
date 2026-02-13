@@ -2,8 +2,11 @@ fastapi==0.115.8
 uvicorn==0.30.6
 python-multipart==0.0.9
 pymupdf==1.24.10
+pymupdf4llm==0.0.17
+pdfplumber==0.11.4
 httpx==0.27.2
 pydantic==2.8.2
 python-dotenv==1.0.1
 networkx==3.3
 scikit-learn==1.5.1
+chromadb==0.5.11

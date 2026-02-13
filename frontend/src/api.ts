@@ -146,6 +146,11 @@ export type Experiment = {
   precision?: number | null;
   recall?: number | null;
   f1?: number | null;
+  dataset?: string | null;
+  split?: string | null;
+  metric_name?: string | null;
+  metric_value?: number | null;
+  is_sota?: number | null;
   created_at?: number | null;
   updated_at?: number | null;
 };
@@ -561,6 +566,11 @@ export async function createExperiment(payload: {
   precision?: number;
   recall?: number;
   f1?: number;
+  dataset?: string;
+  split?: string;
+  metric_name?: string;
+  metric_value?: number;
+  is_sota?: number;
 }): Promise<Experiment> {
   const res = await axios.post(`${API_BASE}/api/experiments`, payload);
   return res.data;
@@ -572,7 +582,8 @@ export async function updateExperiment(
     Pick<
       Experiment,
       "name" | "model" | "params_json" | "metrics_json" | "result_summary" | "artifact_path" |
-      "dataset_name" | "trigger_f1" | "argument_f1" | "precision" | "recall" | "f1"
+      "dataset_name" | "trigger_f1" | "argument_f1" | "precision" | "recall" | "f1" |
+      "dataset" | "split" | "metric_name" | "metric_value" | "is_sota"
     >
   >
 ): Promise<Experiment> {
@@ -638,6 +649,67 @@ export async function chatWithPapers(payload: {
 }): Promise<ChatWithPapersResponse> {
   const res = await axios.post(`${API_BASE}/api/chat/papers`, payload);
   return res.data;
+}
+
+export async function streamChatWithPapers(
+  payload: {
+    query: string;
+    paper_ids?: number[];
+    top_k?: number;
+    language?: "zh" | "en";
+  },
+  handlers: {
+    onMeta?: (meta: { query: string; paper_ids: number[]; context_count: number }) => void;
+    onDelta?: (delta: string) => void;
+    onSources?: (sources: ChatWithPapersResponse["sources"]) => void;
+    onDone?: () => void;
+  }
+): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/chat/papers/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok || !res.body) {
+    throw new Error(`stream failed: ${res.status}`);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const chunks = buffer.split("\n\n");
+    buffer = chunks.pop() || "";
+    for (const chunk of chunks) {
+      const line = chunk
+        .split("\n")
+        .find((entry) => entry.trim().startsWith("data:"));
+      if (!line) continue;
+      const payloadText = line.replace(/^data:\s*/, "");
+      if (!payloadText) continue;
+      let event: any;
+      try {
+        event = JSON.parse(payloadText);
+      } catch {
+        continue;
+      }
+      if (event.type === "meta") {
+        handlers.onMeta?.({
+          query: event.query || "",
+          paper_ids: event.paper_ids || [],
+          context_count: event.context_count || 0
+        });
+      } else if (event.type === "delta") {
+        handlers.onDelta?.(event.delta || "");
+      } else if (event.type === "sources") {
+        handlers.onSources?.(event.sources || []);
+      } else if (event.type === "done") {
+        handlers.onDone?.();
+      }
+    }
+  }
 }
 
 export async function fetchSotaBoard(params?: {

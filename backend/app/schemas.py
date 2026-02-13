@@ -153,6 +153,11 @@ class Experiment(BaseModel):
     precision: float | None = None
     recall: float | None = None
     f1: float | None = None
+    dataset: str | None = None
+    split: str | None = None
+    metric_name: str | None = None
+    metric_value: float | None = None
+    is_sota: int = 0
     created_at: int | None = None
     updated_at: int | None = None
 
@@ -171,6 +176,11 @@ class ExperimentCreate(BaseModel):
     precision: float | None = None
     recall: float | None = None
     f1: float | None = None
+    dataset: str | None = None
+    split: str | None = None
+    metric_name: str | None = None
+    metric_value: float | None = None
+    is_sota: int = 0
 
 
 class ExperimentUpdate(BaseModel):
@@ -186,6 +196,11 @@ class ExperimentUpdate(BaseModel):
     precision: float | None = None
     recall: float | None = None
     f1: float | None = None
+    dataset: str | None = None
+    split: str | None = None
+    metric_name: str | None = None
+    metric_value: float | None = None
+    is_sota: int | None = None
 
 
 class Subfield(BaseModel):

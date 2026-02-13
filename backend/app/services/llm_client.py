@@ -177,6 +177,35 @@ def _call_llm(endpoint: str, headers: Dict[str, str], payload: Dict[str, Any]) -
         return ""
 
 
+def _call_llm_stream(endpoint: str, headers: Dict[str, str], payload: Dict[str, Any]):
+    endpoint = _resolve_endpoint(endpoint)
+    request_payload = dict(payload)
+    request_payload["stream"] = True
+    with httpx.Client(timeout=None) as client:
+        with client.stream("POST", endpoint, headers=headers, json=request_payload) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                text = line.strip()
+                if not text:
+                    continue
+                if text.startswith("data:"):
+                    text = text[5:].strip()
+                if text == "[DONE]":
+                    break
+                try:
+                    data = json.loads(text)
+                except Exception:
+                    continue
+                try:
+                    delta = data["choices"][0]["delta"].get("content")
+                except Exception:
+                    delta = None
+                if isinstance(delta, str) and delta:
+                    yield delta
+
+
 def enrich_metadata(
     raw_text: str,
     sub_fields: list[str] | None = None,
@@ -260,20 +289,13 @@ def summarize_one_line(title: Optional[str], abstract: Optional[str]) -> Optiona
     return content[:300]
 
 
-def chat_with_context(
+def _prepare_chat_context(
     query: str,
     contexts: List[Dict[str, Any]],
     language: str = "zh",
 ) -> Dict[str, Any]:
-    provider = os.getenv("LLM_PROVIDER", "").strip().lower()
-    api_key = os.getenv("LLM_API_KEY", "").strip()
-    endpoint = os.getenv("LLM_ENDPOINT", "").strip()
-    model = os.getenv("LLM_MODEL", "").strip()
-    if not query.strip():
-        return {"answer": "", "sources": []}
-
-    context_lines = []
-    sources = []
+    context_lines: List[str] = []
+    sources: List[Dict[str, Any]] = []
     for idx, ctx in enumerate(contexts[:8], start=1):
         title = (ctx.get("title") or "").strip()
         text = (ctx.get("chunk_text") or ctx.get("text") or "").strip()
@@ -290,7 +312,7 @@ def chat_with_context(
             }
         )
     if not context_lines:
-        return {"answer": "未检索到可用上下文。", "sources": []}
+        return {"prompt": "", "sources": [], "fallback": "未检索到可用上下文。"}
 
     prompt_lang = "Chinese" if language.lower().startswith("zh") else "English"
     prompt = (
@@ -300,21 +322,43 @@ def chat_with_context(
         f"QUESTION:\n{query}\n\n"
         f"CONTEXT:\n{chr(10).join(context_lines)}"
     )
+    return {"prompt": prompt, "sources": sources, "fallback": ""}
+
+
+def _fallback_chat_answer(contexts: List[Dict[str, Any]]) -> str:
+    answer_lines = ["检索到的相关片段如下（未启用LLM回答）："]
+    for idx, ctx in enumerate(contexts[:5], start=1):
+        answer_lines.append(
+            f"{idx}. {ctx.get('title') or 'Untitled'}: {(ctx.get('chunk_text') or '')[:160]}"
+        )
+    return "\n".join(answer_lines)
+
+
+def chat_with_context(
+    query: str,
+    contexts: List[Dict[str, Any]],
+    language: str = "zh",
+) -> Dict[str, Any]:
+    provider = os.getenv("LLM_PROVIDER", "").strip().lower()
+    api_key = os.getenv("LLM_API_KEY", "").strip()
+    endpoint = os.getenv("LLM_ENDPOINT", "").strip()
+    model = os.getenv("LLM_MODEL", "").strip()
+    if not query.strip():
+        return {"answer": "", "sources": []}
+
+    ctx = _prepare_chat_context(query, contexts, language)
+    if not ctx["prompt"]:
+        return {"answer": ctx["fallback"], "sources": ctx["sources"]}
 
     if not provider or not api_key or not endpoint or not model:
-        answer_lines = ["检索到的相关片段如下（未启用LLM回答）："]
-        for idx, ctx in enumerate(contexts[:5], start=1):
-            answer_lines.append(
-                f"{idx}. {ctx.get('title') or 'Untitled'}: {(ctx.get('chunk_text') or '')[:160]}"
-            )
-        return {"answer": "\n".join(answer_lines), "sources": sources}
+        return {"answer": _fallback_chat_answer(contexts), "sources": ctx["sources"]}
 
     headers = {"Authorization": f"Bearer {api_key}"}
     payload = {
         "model": model,
         "messages": [
             {"role": "system", "content": "You are a precise academic assistant."},
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": ctx["prompt"]},
         ],
         "temperature": 0.2,
     }
@@ -324,7 +368,55 @@ def chat_with_context(
         answer = ""
     if not answer:
         answer = "当前无法生成回答，请稍后重试。"
-    return {"answer": answer[:2400], "sources": sources}
+    return {"answer": answer[:2400], "sources": ctx["sources"]}
+
+
+def stream_chat_with_context(
+    query: str,
+    contexts: List[Dict[str, Any]],
+    language: str = "zh",
+):
+    provider = os.getenv("LLM_PROVIDER", "").strip().lower()
+    api_key = os.getenv("LLM_API_KEY", "").strip()
+    endpoint = os.getenv("LLM_ENDPOINT", "").strip()
+    model = os.getenv("LLM_MODEL", "").strip()
+    if not query.strip():
+        yield {"type": "done", "sources": []}
+        return
+
+    ctx = _prepare_chat_context(query, contexts, language)
+    if not ctx["prompt"]:
+        yield {"type": "delta", "delta": ctx["fallback"]}
+        yield {"type": "sources", "sources": ctx["sources"]}
+        return
+
+    if not provider or not api_key or not endpoint or not model:
+        yield {"type": "delta", "delta": _fallback_chat_answer(contexts)}
+        yield {"type": "sources", "sources": ctx["sources"]}
+        return
+
+    headers = {"Authorization": f"Bearer {api_key}"}
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are a precise academic assistant."},
+            {"role": "user", "content": ctx["prompt"]},
+        ],
+        "temperature": 0.2,
+    }
+    emitted = False
+    try:
+        for delta in _call_llm_stream(endpoint, headers, payload):
+            emitted = True
+            yield {"type": "delta", "delta": delta}
+    except Exception:
+        emitted = False
+    if not emitted:
+        result = chat_with_context(query, contexts, language=language)
+        yield {"type": "delta", "delta": result.get("answer") or ""}
+        yield {"type": "sources", "sources": result.get("sources") or []}
+        return
+    yield {"type": "sources", "sources": ctx["sources"]}
 
 
 def classify_citation_intent(

@@ -55,6 +55,7 @@ import {
   comparePapers,
   classifyCitationIntent,
   chatWithPapers,
+  streamChatWithPapers,
   discoverOpenTags,
   type GraphNode,
   type GraphResponse,
@@ -133,6 +134,11 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
   const [expName, setExpName] = useState("");
   const [expModel, setExpModel] = useState("");
   const [expMetrics, setExpMetrics] = useState("");
+  const [expDataset, setExpDataset] = useState("");
+  const [expSplit, setExpSplit] = useState("");
+  const [expMetricName, setExpMetricName] = useState("F1");
+  const [expMetricValue, setExpMetricValue] = useState<number | undefined>();
+  const [expIsSota, setExpIsSota] = useState(false);
   const [experimentLoading, setExperimentLoading] = useState(false);
   const [compareQueue, setCompareQueue] = useState<number[]>([]);
   const [compareData, setCompareData] = useState<ComparePapersResponse | null>(null);
@@ -1047,6 +1053,49 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     }
     setQaLoading(true);
     try {
+      setQaResult({
+        query,
+        paper_ids: paperIds,
+        answer: "",
+        sources: [],
+        context_count: 0
+      });
+      await streamChatWithPapers(
+        {
+          query,
+          paper_ids: paperIds,
+          top_k: 8,
+          language: navigator.language?.toLowerCase().startsWith("zh") ? "zh" : "en"
+        },
+        {
+          onMeta: (meta) =>
+            setQaResult((prev) => ({
+              query: meta.query,
+              paper_ids: meta.paper_ids,
+              answer: prev?.answer ?? "",
+              sources: prev?.sources ?? [],
+              context_count: meta.context_count
+            })),
+          onDelta: (delta) =>
+            setQaResult((prev) => ({
+              query,
+              paper_ids: paperIds,
+              answer: `${prev?.answer || ""}${delta}`,
+              sources: prev?.sources || [],
+              context_count: prev?.context_count || 0
+            })),
+          onSources: (sources) =>
+            setQaResult((prev) => ({
+              query,
+              paper_ids: paperIds,
+              answer: prev?.answer || "",
+              sources,
+              context_count: prev?.context_count || 0
+            }))
+        }
+      );
+    } catch {
+      // Fallback to non-streaming API when SSE is unavailable.
       const result = await chatWithPapers({
         query,
         paper_ids: paperIds,
@@ -2132,6 +2181,37 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
                           placeholder={t("workspace.exp_metrics")}
                           autoSize={{ minRows: 2, maxRows: 4 }}
                         />
+                        <Space size="small" style={{ width: "100%" }} wrap>
+                          <Input
+                            value={expDataset}
+                            onChange={(e) => setExpDataset(e.target.value)}
+                            placeholder="Dataset (ACE2005)"
+                            style={{ width: 150 }}
+                          />
+                          <Input
+                            value={expSplit}
+                            onChange={(e) => setExpSplit(e.target.value)}
+                            placeholder="Split (test)"
+                            style={{ width: 120 }}
+                          />
+                          <Input
+                            value={expMetricName}
+                            onChange={(e) => setExpMetricName(e.target.value)}
+                            placeholder="Metric (F1)"
+                            style={{ width: 120 }}
+                          />
+                          <InputNumber
+                            value={expMetricValue}
+                            onChange={(value) => setExpMetricValue(value ?? undefined)}
+                            min={0}
+                            max={100}
+                            step={0.1}
+                            placeholder="Value"
+                            style={{ width: 110 }}
+                          />
+                          <Switch checked={expIsSota} onChange={setExpIsSota} />
+                          <Text type="secondary">SOTA</Text>
+                        </Space>
                         <Button
                           loading={experimentLoading}
                           onClick={async () => {
@@ -2142,13 +2222,23 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
                                 paper_id: selected.id,
                                 name: expName.trim(),
                                 model: expModel.trim() || undefined,
-                                metrics_json: expMetrics.trim() || undefined
+                                metrics_json: expMetrics.trim() || undefined,
+                                dataset: expDataset.trim() || undefined,
+                                split: expSplit.trim() || undefined,
+                                metric_name: expMetricName.trim() || undefined,
+                                metric_value: expMetricValue,
+                                is_sota: expIsSota ? 1 : 0
                               });
                               const latest = await fetchExperiments({ paper_id: selected.id });
                               setExperiments(latest);
                               setExpName("");
                               setExpModel("");
                               setExpMetrics("");
+                              setExpDataset("");
+                              setExpSplit("");
+                              setExpMetricName("F1");
+                              setExpMetricValue(undefined);
+                              setExpIsSota(false);
                               message.success(t("workspace.exp_added"));
                             } finally {
                               setExperimentLoading(false);
@@ -2183,6 +2273,13 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
                               <Space direction="vertical" size={0}>
                                 <Text>{item.name || "-"}</Text>
                                 <Text type="secondary">{item.model || "-"}</Text>
+                                {item.metric_name && (
+                                  <Text type="secondary">
+                                    {item.dataset || item.dataset_name || "-"} / {item.split || "-"} · {item.metric_name}
+                                    {item.metric_value != null ? `=${item.metric_value}` : ""}
+                                    {item.is_sota ? " · SOTA" : ""}
+                                  </Text>
+                                )}
                                 {item.metrics_json && <Text type="secondary">{item.metrics_json}</Text>}
                               </Space>
                             </List.Item>

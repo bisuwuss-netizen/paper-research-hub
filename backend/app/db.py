@@ -77,6 +77,11 @@ EXPERIMENTS_COLUMNS = {
     "precision": "REAL",
     "recall": "REAL",
     "f1": "REAL",
+    "dataset": "TEXT",
+    "split": "TEXT",
+    "metric_name": "TEXT",
+    "metric_value": "REAL",
+    "is_sota": "INTEGER DEFAULT 0",
 }
 
 

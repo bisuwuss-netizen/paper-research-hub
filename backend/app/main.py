@@ -13,6 +13,7 @@ import hashlib
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
@@ -39,6 +40,7 @@ from .services.llm_client import (
     summarize_one_line,
     extract_references,
     chat_with_context,
+    stream_chat_with_context,
     classify_citation_intent,
     extract_reported_metrics,
 )
@@ -47,7 +49,8 @@ from .services.pdf_extract import (
     extract_text,
     extract_references_text,
     extract_full_text,
-    chunk_text,
+    extract_markdown,
+    extract_tables_text,
     extract_ee_metrics,
 )
 from .services.semantic_scholar import (
@@ -84,7 +87,8 @@ from .services.search_quality import (
     title_similarity,
 )
 from .services.analytics import build_progress_snapshot, build_topic_evolution, to_period
-from .services.rag import text_to_embedding, embedding_to_json, rank_chunks
+from .services.rag import text_to_embedding, embedding_to_json
+from .services.vector_store import index_paper_text, search_paper_chunks
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STORAGE_DIR = os.path.join(BASE_DIR, "storage", "pdfs")
@@ -365,37 +369,17 @@ def _collect_search_documents(conn) -> List[SearchDocument]:
 
 
 def _index_paper_chunks(conn, paper_id: int, full_text: str) -> int:
-    chunks = chunk_text(full_text, chunk_size=900, overlap=160)
-    conn.execute("DELETE FROM paper_chunks WHERE paper_id = ?", (paper_id,))
     now_ts = _now_ts()
-    vectors: List[List[float]] = []
-    for chunk in chunks:
-        vector = text_to_embedding(chunk["text"])
-        vectors.append(vector)
-        conn.execute(
-            """
-            INSERT INTO paper_chunks (paper_id, chunk_index, chunk_text, chunk_embedding, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                paper_id,
-                chunk["index"],
-                chunk["text"],
-                embedding_to_json(vector),
-                now_ts,
-            ),
-        )
-    # Store coarse paper embedding for future indexing.
-    if vectors:
-        dim = len(vectors[0])
-        avg = [0.0] * dim
-        for vec in vectors:
-            for i in range(dim):
-                avg[i] += vec[i]
-        count = float(len(vectors))
-        avg = [round(v / count, 8) for v in avg]
-        repo_update_paper(conn, paper_id, {"embedding": embedding_to_json(avg)})
-    return len(chunks)
+    row = conn.execute("SELECT title FROM papers WHERE id = ?", (paper_id,)).fetchone()
+    title = row["title"] if row else None
+    count = index_paper_text(conn, paper_id, title=title, text=full_text, created_at=now_ts)
+    if not full_text:
+        return 0
+    # Keep a coarse paper-level embedding in SQLite for lightweight ranking/fallback.
+    vector = text_to_embedding(full_text[:6000])
+    if vector:
+        repo_update_paper(conn, paper_id, {"embedding": embedding_to_json(vector)})
+    return count
 
 
 def _retrieve_rag_chunks(
@@ -404,39 +388,7 @@ def _retrieve_rag_chunks(
     paper_ids: Optional[List[int]] = None,
     top_k: int = 6,
 ) -> List[Dict[str, Any]]:
-    if paper_ids:
-        placeholders = ",".join(["?"] * len(paper_ids))
-        rows = conn.execute(
-            f"""
-            SELECT
-                c.paper_id,
-                c.chunk_index,
-                c.chunk_text,
-                c.chunk_embedding,
-                p.title
-            FROM paper_chunks c
-            JOIN papers p ON p.id = c.paper_id
-            WHERE c.paper_id IN ({placeholders})
-            """,
-            paper_ids,
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            """
-            SELECT
-                c.paper_id,
-                c.chunk_index,
-                c.chunk_text,
-                c.chunk_embedding,
-                p.title
-            FROM paper_chunks c
-            JOIN papers p ON p.id = c.paper_id
-            ORDER BY c.created_at DESC
-            LIMIT 3000
-            """
-        ).fetchall()
-    chunks = [dict(r) for r in rows]
-    return rank_chunks(query, chunks, top_k=top_k)
+    return search_paper_chunks(conn, query=query, paper_ids=paper_ids, top_k=top_k)
 
 
 def _upsert_ee_metrics(
@@ -1077,8 +1029,9 @@ def create_experiment(payload: ExperimentCreate):
             INSERT INTO experiments (
                 paper_id, name, model, params_json, metrics_json, result_summary, artifact_path,
                 dataset_name, trigger_f1, argument_f1, precision, recall, f1,
+                dataset, split, metric_name, metric_value, is_sota,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload.paper_id,
@@ -1094,6 +1047,11 @@ def create_experiment(payload: ExperimentCreate):
                 payload.precision,
                 payload.recall,
                 payload.f1,
+                payload.dataset,
+                payload.split,
+                payload.metric_name,
+                payload.metric_value,
+                payload.is_sota,
                 now_ts,
                 now_ts,
             ),
@@ -1406,6 +1364,35 @@ def chat_with_papers(payload: ChatQueryRequest):
             "sources": result.get("sources") or [],
             "context_count": len(contexts),
         }
+
+
+@app.post("/api/chat/papers/stream")
+def chat_with_papers_stream(payload: ChatQueryRequest):
+    query = (payload.query or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query is required")
+    with get_conn() as conn:
+        paper_ids = [int(pid) for pid in payload.paper_ids if pid]
+        contexts = _retrieve_rag_chunks(
+            conn,
+            query,
+            paper_ids=paper_ids or None,
+            top_k=max(2, min(payload.top_k, 12)),
+        )
+
+    def event_stream():
+        init_payload = {
+            "type": "meta",
+            "query": query,
+            "paper_ids": paper_ids,
+            "context_count": len(contexts),
+        }
+        yield f"data: {json.dumps(init_payload, ensure_ascii=False)}\n\n"
+        for event in stream_chat_with_context(query, contexts, language=payload.language):
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        yield "data: {\"type\":\"done\"}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.get("/api/metrics/sota")
@@ -2602,16 +2589,19 @@ def backfill_papers(
                 references_parsed += 1
 
             full_text = ""
+            table_text = ""
             if paper.get("file_path") and (embeddings or metrics):
-                full_text = extract_full_text(paper["file_path"])
+                full_text = extract_markdown(paper["file_path"]) or extract_full_text(paper["file_path"])
+                table_text = extract_tables_text(paper["file_path"])
 
             if embeddings and full_text:
                 chunks_indexed += _index_paper_chunks(conn, paper["id"], full_text)
                 touched = True
 
             if metrics and full_text:
-                extracted_metrics = extract_ee_metrics(full_text, limit=40)
-                llm_metrics = extract_reported_metrics(full_text[:18000], max_items=20)
+                metric_text = "\n".join([full_text, table_text]).strip()
+                extracted_metrics = extract_ee_metrics(metric_text, limit=40)
+                llm_metrics = extract_reported_metrics(metric_text[:18000], max_items=20)
                 if llm_metrics:
                     extracted_metrics.extend(llm_metrics)
                 metrics_upserted += _upsert_ee_metrics(
@@ -2936,7 +2926,8 @@ def upload_paper(file: UploadFile = File(...)):
     with open(file_path, "rb") as f:
         file_hash = hashlib.sha256(f.read()).hexdigest()
     raw_text = extract_text(file_path, max_pages=3)
-    full_text = extract_full_text(file_path)
+    full_text = extract_markdown(file_path) or extract_full_text(file_path)
+    table_text = extract_tables_text(file_path)
     with get_conn() as conn:
         subfields = _get_active_subfields(conn)
         examples = _get_subfield_examples(conn)
@@ -2978,8 +2969,9 @@ def upload_paper(file: UploadFile = File(...)):
         _sync_citations(conn, row, row.get("s2_paper_id"))
         if full_text:
             _index_paper_chunks(conn, row["id"], full_text)
-            metrics = extract_ee_metrics(full_text, limit=40)
-            llm_metrics = extract_reported_metrics(full_text[:18000], max_items=20)
+            metric_text = "\n".join([full_text, table_text]).strip()
+            metrics = extract_ee_metrics(metric_text, limit=40)
+            llm_metrics = extract_reported_metrics(metric_text[:18000], max_items=20)
             if llm_metrics:
                 metrics.extend(llm_metrics)
             _upsert_ee_metrics(conn, row["id"], metrics, source="upload")
