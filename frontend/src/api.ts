@@ -32,6 +32,7 @@ export type Paper = {
   proposed_method_name?: string | null;
   dynamic_tags?: string | null;
   embedding?: string | null;
+  open_sub_field?: string | null;
   created_at?: number | null;
   updated_at?: number | null;
 };
@@ -60,6 +61,7 @@ export type GraphNode = {
   summary_one?: string | null;
   proposed_method_name?: string | null;
   dynamic_tags?: string[] | null;
+  open_sub_field?: string | null;
   open_tasks?: number | null;
   overdue_tasks?: number | null;
   experiment_count?: number | null;
@@ -117,6 +119,34 @@ export type PaperNote = {
   notes?: string | null;
   created_at?: number | null;
   updated_at?: number | null;
+};
+
+export type PaperSchema = {
+  paper_id: number;
+  event_types: Array<{
+    name: string;
+    aliases?: string[];
+    roles?: string[];
+  }>;
+  role_types: string[];
+  schema_notes?: string | null;
+  confidence?: number | null;
+  source?: string | null;
+  updated_at?: number | null;
+};
+
+export type BacklinksResponse = {
+  paper_id: number;
+  count: number;
+  items: Array<{
+    source_paper_id: number;
+    target_paper_id: number;
+    link_text: string;
+    updated_at?: number | null;
+    source_title?: string | null;
+    source_year?: number | null;
+    source_sub_field?: string | null;
+  }>;
 };
 
 export type ReadingTask = {
@@ -237,6 +267,26 @@ export type SotaBoard = {
   }>;
   datasets: string[];
   count: number;
+};
+
+export type MetricLeaderboard = {
+  dataset?: string | null;
+  metric: string;
+  top_items: Array<{
+    paper_id: number;
+    dataset_name?: string | null;
+    metric_value?: number | null;
+    title?: string | null;
+    year?: number | null;
+    sub_field?: string | null;
+    ccf_level?: string | null;
+  }>;
+  trend: Array<{
+    year: number;
+    best_value?: number | null;
+    avg_value?: number | null;
+    sample_count: number;
+  }>;
 };
 
 export type OpenTagDiscovery = {
@@ -488,6 +538,8 @@ export async function backfillPapers(params?: {
   references_parsed: number;
   chunks_indexed?: number;
   metrics_upserted?: number;
+  auto_experiments?: number;
+  schemas_extracted?: number;
 }> {
   const res = await axios.post(`${API_BASE}/api/papers/backfill`, null, { params });
   return res.data;
@@ -511,6 +563,47 @@ export async function savePaperNotes(
   payload: Partial<Omit<PaperNote, "paper_id">>
 ): Promise<PaperNote> {
   const res = await axios.put(`${API_BASE}/api/papers/${paperId}/notes`, payload);
+  return res.data;
+}
+
+export async function fetchPaperBacklinks(paperId: number): Promise<BacklinksResponse> {
+  const res = await axios.get(`${API_BASE}/api/papers/${paperId}/backlinks`);
+  return res.data;
+}
+
+export async function fetchPaperSchema(paperId: number): Promise<PaperSchema> {
+  const res = await axios.get(`${API_BASE}/api/papers/${paperId}/schema`);
+  return res.data;
+}
+
+export async function extractPaperSchema(
+  paperId: number,
+  force = false
+): Promise<PaperSchema> {
+  const res = await axios.post(`${API_BASE}/api/papers/${paperId}/schema/extract`, null, {
+    params: { force }
+  });
+  return res.data;
+}
+
+export async function searchSchemas(
+  keyword: string,
+  limit = 50
+): Promise<{
+  keyword: string;
+  count: number;
+  items: Array<{
+    paper_id: number;
+    title?: string;
+    year?: number;
+    sub_field?: string;
+    event_types: Array<{ name: string; roles?: string[] }>;
+    role_types: string[];
+  }>;
+}> {
+  const res = await axios.get(`${API_BASE}/api/schemas/search`, {
+    params: { keyword, limit }
+  });
   return res.data;
 }
 
@@ -717,6 +810,15 @@ export async function fetchSotaBoard(params?: {
   limit?: number;
 }): Promise<SotaBoard> {
   const res = await axios.get(`${API_BASE}/api/metrics/sota`, { params });
+  return res.data;
+}
+
+export async function fetchMetricLeaderboard(params?: {
+  dataset?: string;
+  metric?: "f1" | "precision" | "recall" | "trigger_f1" | "argument_f1";
+  limit?: number;
+}): Promise<MetricLeaderboard> {
+  const res = await axios.get(`${API_BASE}/api/metrics/leaderboard`, { params });
   return res.data;
 }
 

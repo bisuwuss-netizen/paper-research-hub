@@ -43,6 +43,7 @@ from .services.llm_client import (
     stream_chat_with_context,
     classify_citation_intent,
     extract_reported_metrics,
+    extract_event_schema,
 )
 from .services.pdf_extract import (
     extract_metadata,
@@ -122,6 +123,11 @@ def _cleanup_citations(conn) -> dict:
         "DELETE FROM citations WHERE target_paper_id NOT IN (SELECT id FROM papers)"
     )
     conn.execute("DELETE FROM citations WHERE source_paper_id = target_paper_id")
+    conn.execute("DELETE FROM paper_chunks WHERE paper_id NOT IN (SELECT id FROM papers)")
+    conn.execute("DELETE FROM ee_metrics WHERE paper_id NOT IN (SELECT id FROM papers)")
+    conn.execute("DELETE FROM paper_schemas WHERE paper_id NOT IN (SELECT id FROM papers)")
+    conn.execute("DELETE FROM note_links WHERE source_paper_id NOT IN (SELECT id FROM papers)")
+    conn.execute("DELETE FROM note_links WHERE target_paper_id NOT IN (SELECT id FROM papers)")
     after = conn.execute("SELECT COUNT(*) AS c FROM citations").fetchone()["c"]
     return {"before": before, "after": after, "removed": max(0, before - after)}
 
@@ -278,6 +284,166 @@ def _upsert_note(conn, paper_id: int, payload: Dict[str, Any]) -> Dict[str, Any]
     return _fetch_note(conn, paper_id)
 
 
+def _extract_note_link_tokens(text: str) -> List[str]:
+    if not text:
+        return []
+    matches = re.findall(r"\[\[([^\[\]]+)\]\]", text)
+    tokens: List[str] = []
+    seen = set()
+    for raw in matches:
+        token = raw.strip()
+        if not token:
+            continue
+        key = token.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        tokens.append(token[:160])
+    return tokens
+
+
+def _resolve_note_link_target(conn, token: str) -> Optional[int]:
+    if token.isdigit():
+        row = conn.execute("SELECT id FROM papers WHERE id = ?", (int(token),)).fetchone()
+        return int(row["id"]) if row else None
+    row = conn.execute("SELECT id FROM papers WHERE LOWER(title) = LOWER(?)", (token,)).fetchone()
+    if row:
+        return int(row["id"])
+    rows = conn.execute(
+        "SELECT id, title FROM papers WHERE title LIKE ? LIMIT 50",
+        (f"%{token}%",),
+    ).fetchall()
+    best_id = None
+    best_score = 0.0
+    for item in rows:
+        score = title_similarity(token, item["title"])
+        if score > best_score:
+            best_score = score
+            best_id = int(item["id"])
+    if best_score >= 0.72:
+        return best_id
+    return None
+
+
+def _refresh_note_links(conn, source_paper_id: int, note_text: str) -> int:
+    conn.execute("DELETE FROM note_links WHERE source_paper_id = ?", (source_paper_id,))
+    tokens = _extract_note_link_tokens(note_text)
+    if not tokens:
+        return 0
+    now_ts = _now_ts()
+    inserted = 0
+    for token in tokens:
+        target_id = _resolve_note_link_target(conn, token)
+        if not target_id or target_id == source_paper_id:
+            continue
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO note_links (
+                source_paper_id, target_paper_id, link_text, context, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (source_paper_id, target_id, token, None, now_ts, now_ts),
+        )
+        inserted += 1
+    return inserted
+
+
+def _fetch_backlinks(conn, paper_id: int, limit: int = 100) -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT
+            l.source_paper_id,
+            l.target_paper_id,
+            l.link_text,
+            l.updated_at,
+            p.title AS source_title,
+            p.year AS source_year,
+            p.sub_field AS source_sub_field
+        FROM note_links l
+        JOIN papers p ON p.id = l.source_paper_id
+        WHERE l.target_paper_id = ?
+        ORDER BY COALESCE(l.updated_at, 0) DESC
+        LIMIT ?
+        """,
+        (paper_id, max(1, min(limit, 200))),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _fetch_paper_schema(conn, paper_id: int) -> Dict[str, Any]:
+    row = conn.execute(
+        "SELECT * FROM paper_schemas WHERE paper_id = ?",
+        (paper_id,),
+    ).fetchone()
+    if not row:
+        return {
+            "paper_id": paper_id,
+            "event_types": [],
+            "role_types": [],
+            "schema_notes": None,
+            "confidence": None,
+            "source": None,
+            "updated_at": None,
+        }
+    data = dict(row)
+    return {
+        "paper_id": paper_id,
+        "event_types": _json_loads(data.get("event_types_json"), []),
+        "role_types": _json_loads(data.get("role_types_json"), []),
+        "schema_notes": data.get("schema_notes"),
+        "confidence": data.get("confidence"),
+        "source": data.get("source"),
+        "updated_at": data.get("updated_at"),
+    }
+
+
+def _upsert_paper_schema(
+    conn,
+    paper_id: int,
+    schema: Dict[str, Any],
+    source: str,
+) -> Dict[str, Any]:
+    now_ts = _now_ts()
+    conn.execute(
+        """
+        INSERT INTO paper_schemas (
+            paper_id, event_types_json, role_types_json, schema_notes, confidence, source, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(paper_id) DO UPDATE SET
+            event_types_json = excluded.event_types_json,
+            role_types_json = excluded.role_types_json,
+            schema_notes = excluded.schema_notes,
+            confidence = excluded.confidence,
+            source = excluded.source,
+            updated_at = excluded.updated_at
+        """,
+        (
+            paper_id,
+            _json_dumps(schema.get("event_types") or []),
+            _json_dumps(schema.get("role_types") or []),
+            schema.get("schema_notes"),
+            schema.get("confidence"),
+            source,
+            now_ts,
+        ),
+    )
+    return _fetch_paper_schema(conn, paper_id)
+
+
+def _extract_and_store_schema(
+    conn,
+    paper_id: int,
+    full_text: str,
+    source: str,
+    force: bool = False,
+) -> Dict[str, Any]:
+    existing = _fetch_paper_schema(conn, paper_id)
+    if not force and existing.get("event_types"):
+        return existing
+    schema = extract_event_schema(full_text, max_types=24)
+    return _upsert_paper_schema(conn, paper_id, schema=schema, source=source)
+
+
 def _sync_search_fts(conn) -> None:
     try:
         conn.execute("DELETE FROM paper_search_fts")
@@ -291,6 +457,7 @@ def _sync_search_fts(conn) -> None:
             p.abstract,
             p.proposed_method_name,
             p.dynamic_tags,
+            p.open_sub_field,
             p.keywords,
             n.method,
             n.datasets,
@@ -312,6 +479,7 @@ def _sync_search_fts(conn) -> None:
                 row["risks"] or "",
                 row["notes"] or "",
                 row["proposed_method_name"] or "",
+                row["open_sub_field"] or "",
                 row["keywords"] or "",
                 " ".join(_normalize_open_tags(row["dynamic_tags"])),
             ]
@@ -331,6 +499,7 @@ def _collect_search_documents(conn) -> List[SearchDocument]:
             p.abstract,
             p.proposed_method_name,
             p.dynamic_tags,
+            p.open_sub_field,
             p.keywords,
             n.method,
             n.datasets,
@@ -353,6 +522,7 @@ def _collect_search_documents(conn) -> List[SearchDocument]:
                 r["risks"] or "",
                 r["notes"] or "",
                 r["proposed_method_name"] or "",
+                r["open_sub_field"] or "",
                 r["keywords"] or "",
                 " ".join(_normalize_open_tags(r["dynamic_tags"])),
             ]
@@ -433,6 +603,72 @@ def _upsert_ee_metrics(
     return inserted
 
 
+def _sync_auto_experiments_from_metrics(conn, paper_id: int, metrics: List[Dict[str, Any]]) -> int:
+    if not metrics:
+        conn.execute(
+            "DELETE FROM experiments WHERE paper_id = ? AND name LIKE 'AUTO_METRIC:%'",
+            (paper_id,),
+        )
+        return 0
+    conn.execute(
+        "DELETE FROM experiments WHERE paper_id = ? AND name LIKE 'AUTO_METRIC:%'",
+        (paper_id,),
+    )
+    now_ts = _now_ts()
+    inserted = 0
+    metric_fields = [
+        ("f1", "F1"),
+        ("precision", "Precision"),
+        ("recall", "Recall"),
+        ("trigger_f1", "Trigger F1"),
+        ("argument_f1", "Argument F1"),
+    ]
+    for item in metrics:
+        dataset = item.get("dataset_name") or "Unknown"
+        for key, label in metric_fields:
+            value = item.get(key)
+            if value is None:
+                continue
+            try:
+                val = float(value)
+            except Exception:
+                continue
+            conn.execute(
+                """
+                INSERT INTO experiments (
+                    paper_id, name, model, params_json, metrics_json, result_summary, artifact_path,
+                    dataset_name, trigger_f1, argument_f1, precision, recall, f1,
+                    dataset, split, metric_name, metric_value, is_sota,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    paper_id,
+                    f"AUTO_METRIC:{dataset}:{label}",
+                    "auto_extractor",
+                    None,
+                    _json_dumps(item),
+                    f"Auto extracted {label} on {dataset}",
+                    None,
+                    dataset,
+                    item.get("trigger_f1"),
+                    item.get("argument_f1"),
+                    item.get("precision"),
+                    item.get("recall"),
+                    item.get("f1"),
+                    dataset,
+                    "test",
+                    label,
+                    val,
+                    1 if key in {"f1", "trigger_f1", "argument_f1"} and val >= 80 else 0,
+                    now_ts,
+                    now_ts,
+                ),
+            )
+            inserted += 1
+    return inserted
+
+
 def _normalize_open_tags(tags: Any) -> List[str]:
     if isinstance(tags, str):
         parsed = _json_loads(tags, None)
@@ -461,9 +697,9 @@ def _normalize_open_tags(tags: Any) -> List[str]:
 def _discover_open_subfields(conn, limit: int = 100) -> List[str]:
     rows = conn.execute(
         """
-        SELECT dynamic_tags, keywords, sub_field
+        SELECT dynamic_tags, keywords, sub_field, open_sub_field
         FROM papers
-        WHERE dynamic_tags IS NOT NULL OR keywords IS NOT NULL
+        WHERE dynamic_tags IS NOT NULL OR keywords IS NOT NULL OR open_sub_field IS NOT NULL
         ORDER BY updated_at DESC
         LIMIT ?
         """,
@@ -473,6 +709,8 @@ def _discover_open_subfields(conn, limit: int = 100) -> List[str]:
     existing = {r["name"].lower() for r in conn.execute("SELECT name FROM subfields").fetchall()}
     for row in rows:
         tags = _normalize_open_tags(row["dynamic_tags"])
+        if row.get("open_sub_field"):
+            tags = [row["open_sub_field"], *tags]
         if not tags and row["keywords"]:
             tags = [x.strip() for x in str(row["keywords"]).split(",") if x.strip()]
         for tag in tags:
@@ -532,6 +770,65 @@ def _build_sota_board(conn, dataset: Optional[str] = None, limit: int = 50) -> D
     rows = [dict(r) for r in conn.execute(query, params).fetchall()]
     datasets = sorted({(r.get("dataset_name") or "").strip() for r in rows if r.get("dataset_name")})
     return {"dataset": dataset, "items": rows, "datasets": datasets, "count": len(rows)}
+
+
+def _build_metric_leaderboard(
+    conn,
+    dataset: Optional[str] = None,
+    metric: str = "f1",
+    limit: int = 50,
+) -> Dict[str, Any]:
+    metric = (metric or "f1").strip().lower()
+    metric_column = {
+        "f1": "f1",
+        "precision": "precision",
+        "recall": "recall",
+        "trigger_f1": "trigger_f1",
+        "argument_f1": "argument_f1",
+    }.get(metric, "f1")
+    params: List[Any] = []
+    where = f"WHERE m.{metric_column} IS NOT NULL"
+    if dataset:
+        where += " AND LOWER(m.dataset_name) = LOWER(?)"
+        params.append(dataset)
+    query = f"""
+        SELECT
+            m.paper_id,
+            m.dataset_name,
+            m.{metric_column} AS metric_value,
+            p.title,
+            p.year,
+            p.sub_field,
+            p.ccf_level
+        FROM ee_metrics m
+        JOIN papers p ON p.id = m.paper_id
+        {where}
+        ORDER BY m.{metric_column} DESC, COALESCE(p.year, 0) DESC
+        LIMIT ?
+    """
+    params.append(max(1, min(limit, 300)))
+    top_rows = [dict(r) for r in conn.execute(query, params).fetchall()]
+
+    trend_query = f"""
+        SELECT
+            COALESCE(p.year, 0) AS year,
+            MAX(m.{metric_column}) AS best_value,
+            AVG(m.{metric_column}) AS avg_value,
+            COUNT(*) AS sample_count
+        FROM ee_metrics m
+        JOIN papers p ON p.id = m.paper_id
+        {where}
+        GROUP BY COALESCE(p.year, 0)
+        ORDER BY year ASC
+    """
+    trend_rows = [dict(r) for r in conn.execute(trend_query, params[:-1] if params else []).fetchall()]
+    trend_rows = [row for row in trend_rows if row.get("year")]
+    return {
+        "dataset": dataset,
+        "metric": metric_column,
+        "top_items": top_rows,
+        "trend": trend_rows,
+    }
 
 
 def _get_shortest_path(
@@ -907,8 +1204,98 @@ def save_paper_notes(paper_id: int, payload: PaperNoteUpdate):
         if not row:
             raise HTTPException(status_code=404, detail="Paper not found")
         note = _upsert_note(conn, paper_id, updates)
+        _refresh_note_links(conn, paper_id, note.get("notes") or "")
         _sync_search_fts(conn)
         return PaperNote(**note)
+
+
+@app.get("/api/papers/{paper_id}/backlinks")
+def get_paper_backlinks(paper_id: int, limit: int = 100):
+    with get_conn() as conn:
+        row = conn.execute("SELECT id FROM papers WHERE id = ?", (paper_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Paper not found")
+        items = _fetch_backlinks(conn, paper_id, limit=limit)
+        return {"paper_id": paper_id, "count": len(items), "items": items}
+
+
+@app.get("/api/papers/{paper_id}/schema")
+def get_paper_schema(paper_id: int):
+    with get_conn() as conn:
+        row = conn.execute("SELECT id FROM papers WHERE id = ?", (paper_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Paper not found")
+        return _fetch_paper_schema(conn, paper_id)
+
+
+@app.post("/api/papers/{paper_id}/schema/extract")
+def extract_paper_schema(paper_id: int, force: bool = False):
+    with get_conn() as conn:
+        row = conn.execute("SELECT id, file_path FROM papers WHERE id = ?", (paper_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Paper not found")
+        paper = dict(row)
+        file_path = paper.get("file_path")
+        if not file_path:
+            raise HTTPException(status_code=400, detail="Paper has no uploaded PDF")
+        text = extract_markdown(file_path) or extract_full_text(file_path)
+        if not text:
+            raise HTTPException(status_code=400, detail="Failed to extract PDF text")
+        schema = _extract_and_store_schema(conn, paper_id, text, source="manual_extract", force=force)
+        return schema
+
+
+@app.get("/api/schemas/search")
+def search_schemas(keyword: str, limit: int = 50):
+    key = (keyword or "").strip().lower()
+    if not key:
+        return {"keyword": keyword, "count": 0, "items": []}
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                s.paper_id,
+                s.event_types_json,
+                s.role_types_json,
+                s.schema_notes,
+                p.title,
+                p.year,
+                p.sub_field
+            FROM paper_schemas s
+            JOIN papers p ON p.id = s.paper_id
+            ORDER BY COALESCE(s.updated_at, 0) DESC
+            LIMIT ?
+            """,
+            (max(1, min(limit * 4, 500)),),
+        ).fetchall()
+        items: List[Dict[str, Any]] = []
+        for row in rows:
+            data = dict(row)
+            event_types = _json_loads(data.get("event_types_json"), [])
+            role_types = _json_loads(data.get("role_types_json"), [])
+            flat = " ".join(
+                [
+                    str(data.get("title") or ""),
+                    str(data.get("schema_notes") or ""),
+                    " ".join([str(r) for r in role_types]),
+                    " ".join([str(e.get("name") or "") for e in event_types if isinstance(e, dict)]),
+                ]
+            ).lower()
+            if key not in flat:
+                continue
+            items.append(
+                {
+                    "paper_id": data["paper_id"],
+                    "title": data.get("title"),
+                    "year": data.get("year"),
+                    "sub_field": data.get("sub_field"),
+                    "event_types": event_types,
+                    "role_types": role_types,
+                }
+            )
+            if len(items) >= limit:
+                break
+        return {"keyword": keyword, "count": len(items), "items": items}
 
 
 @app.get("/api/tasks", response_model=List[ReadingTask])
@@ -1178,6 +1565,47 @@ def quality_merge(payload: MergeRequest):
 
         conn.execute("UPDATE reading_tasks SET paper_id = ? WHERE paper_id = ?", (target_id, source_id))
         conn.execute("UPDATE experiments SET paper_id = ? WHERE paper_id = ?", (target_id, source_id))
+        conn.execute("UPDATE ee_metrics SET paper_id = ? WHERE paper_id = ?", (target_id, source_id))
+        conn.execute("UPDATE paper_chunks SET paper_id = ? WHERE paper_id = ?", (target_id, source_id))
+        conn.execute("UPDATE note_links SET source_paper_id = ? WHERE source_paper_id = ?", (target_id, source_id))
+        conn.execute("UPDATE note_links SET target_paper_id = ? WHERE target_paper_id = ?", (target_id, source_id))
+        conn.execute(
+            """
+            DELETE FROM note_links
+            WHERE id NOT IN (
+                SELECT MIN(id)
+                FROM note_links
+                GROUP BY source_paper_id, target_paper_id, link_text
+            )
+            """
+        )
+        source_schema = conn.execute(
+            "SELECT * FROM paper_schemas WHERE paper_id = ?",
+            (source_id,),
+        ).fetchone()
+        target_schema = conn.execute(
+            "SELECT * FROM paper_schemas WHERE paper_id = ?",
+            (target_id,),
+        ).fetchone()
+        if source_schema and not target_schema:
+            schema = dict(source_schema)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO paper_schemas (
+                    paper_id, event_types_json, role_types_json, schema_notes, confidence, source, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    target_id,
+                    schema.get("event_types_json"),
+                    schema.get("role_types_json"),
+                    schema.get("schema_notes"),
+                    schema.get("confidence"),
+                    schema.get("source"),
+                    schema.get("updated_at"),
+                ),
+            )
+        conn.execute("DELETE FROM paper_schemas WHERE paper_id = ?", (source_id,))
         conn.execute("UPDATE zotero_sync_logs SET paper_id = ? WHERE paper_id = ?", (target_id, source_id))
         conn.execute("DELETE FROM sync_queue WHERE paper_id = ?", (source_id,))
 
@@ -1200,6 +1628,9 @@ def quality_merge(payload: MergeRequest):
             "venue",
             "summary_one",
             "file_hash",
+            "proposed_method_name",
+            "dynamic_tags",
+            "open_sub_field",
         ]:
             if not target.get(field) and source.get(field):
                 updates[field] = source.get(field)
@@ -1289,6 +1720,47 @@ def quality_auto_merge(limit: int = 20, title_threshold: float = 0.96):
                 )
                 conn.execute("UPDATE reading_tasks SET paper_id = ? WHERE paper_id = ?", (keeper, source))
                 conn.execute("UPDATE experiments SET paper_id = ? WHERE paper_id = ?", (keeper, source))
+                conn.execute("UPDATE ee_metrics SET paper_id = ? WHERE paper_id = ?", (keeper, source))
+                conn.execute("UPDATE paper_chunks SET paper_id = ? WHERE paper_id = ?", (keeper, source))
+                conn.execute("UPDATE note_links SET source_paper_id = ? WHERE source_paper_id = ?", (keeper, source))
+                conn.execute("UPDATE note_links SET target_paper_id = ? WHERE target_paper_id = ?", (keeper, source))
+                conn.execute(
+                    """
+                    DELETE FROM note_links
+                    WHERE id NOT IN (
+                        SELECT MIN(id)
+                        FROM note_links
+                        GROUP BY source_paper_id, target_paper_id, link_text
+                    )
+                    """
+                )
+                source_schema = conn.execute(
+                    "SELECT * FROM paper_schemas WHERE paper_id = ?",
+                    (source,),
+                ).fetchone()
+                keeper_schema = conn.execute(
+                    "SELECT * FROM paper_schemas WHERE paper_id = ?",
+                    (keeper,),
+                ).fetchone()
+                if source_schema and not keeper_schema:
+                    schema = dict(source_schema)
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO paper_schemas (
+                            paper_id, event_types_json, role_types_json, schema_notes, confidence, source, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            keeper,
+                            schema.get("event_types_json"),
+                            schema.get("role_types_json"),
+                            schema.get("schema_notes"),
+                            schema.get("confidence"),
+                            schema.get("source"),
+                            schema.get("updated_at"),
+                        ),
+                    )
+                conn.execute("DELETE FROM paper_schemas WHERE paper_id = ?", (source,))
                 conn.execute("UPDATE zotero_sync_logs SET paper_id = ? WHERE paper_id = ?", (keeper, source))
                 conn.execute("DELETE FROM paper_notes WHERE paper_id = ?", (source,))
                 conn.execute("DELETE FROM sync_queue WHERE paper_id = ?", (source,))
@@ -1399,6 +1871,16 @@ def chat_with_papers_stream(payload: ChatQueryRequest):
 def metrics_sota(dataset: Optional[str] = None, limit: int = 50):
     with get_conn() as conn:
         return _build_sota_board(conn, dataset=dataset, limit=limit)
+
+
+@app.get("/api/metrics/leaderboard")
+def metrics_leaderboard(
+    dataset: Optional[str] = None,
+    metric: str = "f1",
+    limit: int = 50,
+):
+    with get_conn() as conn:
+        return _build_metric_leaderboard(conn, dataset=dataset, metric=metric, limit=limit)
 
 
 @app.post("/api/papers/compare")
@@ -2205,6 +2687,7 @@ def get_graph(
                     "summary_one": p.get("summary_one"),
                     "proposed_method_name": p.get("proposed_method_name"),
                     "dynamic_tags": _normalize_open_tags(p.get("dynamic_tags")),
+                    "open_sub_field": p.get("open_sub_field"),
                     "open_tasks": task["open"],
                     "overdue_tasks": task["overdue"],
                     "experiment_count": exp_stats.get(p["id"], 0),
@@ -2362,6 +2845,7 @@ def graph_neighbors(node_id: int, depth: int = 1, limit: int = 200):
                     "summary_one": p.get("summary_one"),
                     "proposed_method_name": p.get("proposed_method_name"),
                     "dynamic_tags": _normalize_open_tags(p.get("dynamic_tags")),
+                    "open_sub_field": p.get("open_sub_field"),
                     "open_tasks": task["open"],
                     "overdue_tasks": task["overdue"],
                     "experiment_count": exp_stats.get(p["id"], 0),
@@ -2542,6 +3026,8 @@ def backfill_papers(
     references_parsed = 0
     chunks_indexed = 0
     metrics_upserted = 0
+    auto_experiments = 0
+    schemas_extracted = 0
     touched = False
     with get_conn() as conn:
         clauses = ["file_path IS NOT NULL"]
@@ -2597,6 +3083,15 @@ def backfill_papers(
             if embeddings and full_text:
                 chunks_indexed += _index_paper_chunks(conn, paper["id"], full_text)
                 touched = True
+                schema = _extract_and_store_schema(
+                    conn,
+                    paper_id=paper["id"],
+                    full_text=full_text,
+                    source="backfill",
+                    force=force,
+                )
+                if schema.get("event_types"):
+                    schemas_extracted += 1
 
             if metrics and full_text:
                 metric_text = "\n".join([full_text, table_text]).strip()
@@ -2606,6 +3101,9 @@ def backfill_papers(
                     extracted_metrics.extend(llm_metrics)
                 metrics_upserted += _upsert_ee_metrics(
                     conn, paper["id"], extracted_metrics, source="backfill"
+                )
+                auto_experiments += _sync_auto_experiments_from_metrics(
+                    conn, paper["id"], extracted_metrics
                 )
                 touched = True
 
@@ -2620,6 +3118,8 @@ def backfill_papers(
         "references_parsed": references_parsed,
         "chunks_indexed": chunks_indexed,
         "metrics_upserted": metrics_upserted,
+        "auto_experiments": auto_experiments,
+        "schemas_extracted": schemas_extracted,
     }
 
 def _contains_cjk(text: Optional[str]) -> bool:
@@ -2719,6 +3219,7 @@ def _merge_metadata(
     data["doi"] = llm_data.get("doi") or extracted.doi
     data["abstract"] = llm_data.get("abstract") or extracted.abstract
     data["sub_field"] = llm_data.get("sub_field")
+    data["open_sub_field"] = llm_data.get("open_sub_field")
     data["proposed_method_name"] = llm_data.get("proposed_method_name")
     dynamic_tags = _normalize_open_tags(llm_data.get("dynamic_tags"))
     if dynamic_tags:
@@ -2945,6 +3446,8 @@ def upload_paper(file: UploadFile = File(...)):
     merged["file_hash"] = file_hash
     if not merged.get("summary_one"):
         merged["summary_one"] = summarize_one_line(merged.get("title"), merged.get("abstract"))
+    if not merged.get("sub_field") and merged.get("open_sub_field"):
+        merged["sub_field"] = merged.get("open_sub_field")
     if not merged.get("sub_field"):
         merged["sub_field"] = _infer_sub_field(
             f"{merged.get('title') or ''} {merged.get('abstract') or ''}"
@@ -2969,12 +3472,20 @@ def upload_paper(file: UploadFile = File(...)):
         _sync_citations(conn, row, row.get("s2_paper_id"))
         if full_text:
             _index_paper_chunks(conn, row["id"], full_text)
+            _extract_and_store_schema(
+                conn,
+                paper_id=row["id"],
+                full_text=full_text,
+                source="upload",
+                force=False,
+            )
             metric_text = "\n".join([full_text, table_text]).strip()
             metrics = extract_ee_metrics(metric_text, limit=40)
             llm_metrics = extract_reported_metrics(metric_text[:18000], max_items=20)
             if llm_metrics:
                 metrics.extend(llm_metrics)
             _upsert_ee_metrics(conn, row["id"], metrics, source="upload")
+            _sync_auto_experiments_from_metrics(conn, row["id"], metrics)
         enqueue_paper(conn, row["id"], delay_seconds=0)
         _sync_search_fts(conn)
         row = conn.execute("SELECT * FROM papers WHERE id = ?", (row["id"],)).fetchone()

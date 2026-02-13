@@ -27,6 +27,7 @@ import {
   fetchDuplicateGroups,
   fetchPapers,
   fetchReports,
+  fetchMetricLeaderboard,
   fetchSotaBoard,
   fetchTasks,
   fetchTopicEvolution,
@@ -45,6 +46,7 @@ import {
   type Report,
   type SearchResult,
   type SotaBoard,
+  type MetricLeaderboard,
   type TopicEvolution,
   type TopicRiver,
   type ZoteroSyncLog
@@ -84,6 +86,8 @@ function DashboardPage({
   const [topicEvolution, setTopicEvolution] = useState<TopicEvolution | null>(null);
   const [topicRiver, setTopicRiver] = useState<TopicRiver | null>(null);
   const [sotaBoard, setSotaBoard] = useState<SotaBoard | null>(null);
+  const [metricBoard, setMetricBoard] = useState<MetricLeaderboard | null>(null);
+  const [metricType, setMetricType] = useState<"f1" | "precision" | "recall" | "trigger_f1" | "argument_f1">("f1");
   const [sotaDataset, setSotaDataset] = useState<string | undefined>();
   const [reports, setReports] = useState<Report[]>([]);
   const [insightLoading, setInsightLoading] = useState(false);
@@ -178,16 +182,18 @@ function DashboardPage({
   const refreshInsights = async () => {
     setInsightLoading(true);
     try {
-      const [evolution, river, reportRows, sota] = await Promise.all([
+      const [evolution, river, reportRows, sota, metric] = await Promise.all([
         fetchTopicEvolution(),
         fetchTopicRiver(),
         fetchReports({ limit: 20 }),
-        fetchSotaBoard({ dataset: sotaDataset, limit: 50 })
+        fetchSotaBoard({ dataset: sotaDataset, limit: 50 }),
+        fetchMetricLeaderboard({ metric: metricType, limit: 60 })
       ]);
       setTopicEvolution(evolution);
       setTopicRiver(river);
       setReports(reportRows);
       setSotaBoard(sota);
+      setMetricBoard(metric);
     } finally {
       setInsightLoading(false);
     }
@@ -228,7 +234,7 @@ function DashboardPage({
   useEffect(() => {
     refreshInsights();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sotaDataset]);
+  }, [sotaDataset, metricType]);
 
   return (
     <>
@@ -459,6 +465,20 @@ function DashboardPage({
                       options={(sotaBoard?.datasets || []).map((d) => ({ label: d, value: d }))}
                       onChange={(value) => setSotaDataset(value)}
                     />
+                    <Select
+                      value={metricType}
+                      style={{ width: 160 }}
+                      onChange={(value) =>
+                        setMetricType(value as "f1" | "precision" | "recall" | "trigger_f1" | "argument_f1")
+                      }
+                      options={[
+                        { label: "F1", value: "f1" },
+                        { label: "Precision", value: "precision" },
+                        { label: "Recall", value: "recall" },
+                        { label: t("insight.trigger_f1"), value: "trigger_f1" },
+                        { label: t("insight.argument_f1"), value: "argument_f1" }
+                      ]}
+                    />
                     <Button onClick={refreshInsights} loading={insightLoading}>
                       {t("btn.refresh")}
                     </Button>
@@ -479,6 +499,18 @@ function DashboardPage({
                       { title: t("table.year"), dataIndex: "year", key: "year", width: 76 }
                     ]}
                   />
+                  <div style={{ width: "100%", height: 200, marginTop: 12 }}>
+                    <ResponsiveContainer>
+                      <AreaChart data={metricBoard?.trend || []}>
+                        <CartesianGrid strokeDasharray="3 3" />
+                        <XAxis dataKey="year" />
+                        <YAxis />
+                        <Tooltip />
+                        <Area type="monotone" dataKey="best_value" stroke="#ff7a59" fill="rgba(255,122,89,0.28)" />
+                        <Area type="monotone" dataKey="avg_value" stroke="#1f7a6d" fill="rgba(31,122,109,0.22)" />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </div>
                 </Card>
                 <Card size="small" title={t("report.list")}>
                   <List

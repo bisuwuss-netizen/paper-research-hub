@@ -57,6 +57,7 @@ PAPERS_COLUMNS = {
     "proposed_method_name": "TEXT",
     "dynamic_tags": "TEXT",
     "embedding": "TEXT",
+    "open_sub_field": "TEXT",
 }
 
 
@@ -178,6 +179,35 @@ def ensure_db() -> None:
                 risks TEXT,
                 notes TEXT,
                 created_at INTEGER,
+                updated_at INTEGER,
+                FOREIGN KEY(paper_id) REFERENCES papers(id)
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS note_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_paper_id INTEGER,
+                target_paper_id INTEGER,
+                link_text TEXT,
+                context TEXT,
+                created_at INTEGER,
+                updated_at INTEGER,
+                FOREIGN KEY(source_paper_id) REFERENCES papers(id),
+                FOREIGN KEY(target_paper_id) REFERENCES papers(id)
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS paper_schemas (
+                paper_id INTEGER PRIMARY KEY,
+                event_types_json TEXT,
+                role_types_json TEXT,
+                schema_notes TEXT,
+                confidence REAL,
+                source TEXT,
                 updated_at INTEGER,
                 FOREIGN KEY(paper_id) REFERENCES papers(id)
             );
@@ -321,6 +351,16 @@ def ensure_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_papers_updated_at ON papers(updated_at)")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_feedback_subfield ON subfield_feedback(sub_field)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_note_links_target ON note_links(target_paper_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_note_links_source ON note_links(source_paper_id)"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_note_links_unique "
+            "ON note_links(source_paper_id, target_paper_id, link_text)"
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tasks_paper_status ON reading_tasks(paper_id, status)"

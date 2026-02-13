@@ -40,6 +40,7 @@ PAPER_FIELDS = [
     "proposed_method_name",
     "dynamic_tags",
     "embedding",
+    "open_sub_field",
 ]
 
 

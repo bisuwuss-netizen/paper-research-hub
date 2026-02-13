@@ -44,6 +44,10 @@ import {
   backfillPapers,
   fetchPaperNotes,
   savePaperNotes,
+  fetchPaperBacklinks,
+  fetchPaperSchema,
+  extractPaperSchema,
+  searchSchemas,
   fetchTasks,
   createTask,
   updateTask,
@@ -57,15 +61,19 @@ import {
   chatWithPapers,
   streamChatWithPapers,
   discoverOpenTags,
+  fetchMetricLeaderboard,
   type GraphNode,
   type GraphResponse,
   type Subfield,
   type SyncStatus,
   type PaperNote,
+  type PaperSchema,
+  type BacklinksResponse,
   type ReadingTask,
   type Experiment,
   type ComparePapersResponse,
-  type ChatWithPapersResponse
+  type ChatWithPapersResponse,
+  type MetricLeaderboard
 } from "./api";
 
 const { Title, Text, Paragraph } = Typography;
@@ -126,6 +134,24 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
   const [sidebarDrawerOpen, setSidebarDrawerOpen] = useState(false);
   const [note, setNote] = useState<PaperNote | null>(null);
   const [noteSaving, setNoteSaving] = useState(false);
+  const [backlinks, setBacklinks] = useState<BacklinksResponse | null>(null);
+  const [paperSchema, setPaperSchema] = useState<PaperSchema | null>(null);
+  const [schemaLoading, setSchemaLoading] = useState(false);
+  const [schemaKeyword, setSchemaKeyword] = useState("");
+  const [schemaSearchResults, setSchemaSearchResults] = useState<
+    Array<{
+      paper_id: number;
+      title?: string;
+      year?: number;
+      sub_field?: string;
+      event_types: Array<{ name: string; roles?: string[] }>;
+      role_types: string[];
+    }>
+  >([]);
+  const [metricLeaderboard, setMetricLeaderboard] = useState<MetricLeaderboard | null>(null);
+  const [metricType, setMetricType] = useState<"f1" | "precision" | "recall" | "trigger_f1" | "argument_f1">(
+    "f1"
+  );
   const [tasks, setTasks] = useState<ReadingTask[]>([]);
   const [taskTitle, setTaskTitle] = useState("");
   const [taskDueDate, setTaskDueDate] = useState<string | undefined>();
@@ -342,14 +368,20 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
 
   const loadNodeWorkspace = async (paperId: number) => {
     try {
-      const [noteData, taskData, experimentData] = await Promise.all([
+      const [noteData, taskData, experimentData, backlinkData, schemaData, metricData] = await Promise.all([
         fetchPaperNotes(paperId),
         fetchTasks({ paper_id: paperId }),
-        fetchExperiments({ paper_id: paperId })
+        fetchExperiments({ paper_id: paperId }),
+        fetchPaperBacklinks(paperId),
+        fetchPaperSchema(paperId),
+        fetchMetricLeaderboard({ metric: metricType, limit: 20 })
       ]);
       setNote(noteData);
       setTasks(taskData);
       setExperiments(experimentData);
+      setBacklinks(backlinkData);
+      setPaperSchema(schemaData);
+      setMetricLeaderboard(metricData);
     } catch {
       // ignore
     }
@@ -360,13 +392,15 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
       setNote(null);
       setTasks([]);
       setExperiments([]);
+      setBacklinks(null);
+      setPaperSchema(null);
       return;
     }
     loadNodeWorkspace(selected.id);
     if (focusMode) {
       loadNeighbors();
     }
-  }, [selected?.id, focusMode]);
+  }, [selected?.id, focusMode, metricType]);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -1596,7 +1630,7 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
                 force: false
               });
               message.success(
-                `${t("backfill.result")}: ${res.processed}, ${t("backfill.summaries")} ${res.summary_added}, ${t("backfill.refs")} ${res.references_parsed}`
+                `${t("backfill.result")}: ${res.processed}, ${t("backfill.summaries")} ${res.summary_added}, ${t("backfill.refs")} ${res.references_parsed}, schema ${res.schemas_extracted ?? 0}, exp ${res.auto_experiments ?? 0}`
               );
               fetchData(subField, yearRange);
             } finally {
@@ -1817,6 +1851,9 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
               <Space size="small">
                 {selected.year && <Tag>{selected.year}</Tag>}
                 {selected.sub_field && <Tag color="geekblue">{selected.sub_field}</Tag>}
+                {!selected.sub_field && selected.open_sub_field && (
+                  <Tag color="magenta">{selected.open_sub_field}</Tag>
+                )}
                 {selected.ccf_level && <Tag color="red">CCF {selected.ccf_level}</Tag>}
               </Space>
               <div>
@@ -2069,6 +2106,8 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
                                 notes: note.notes ?? null
                               });
                               setNote(saved);
+                              const links = await fetchPaperBacklinks(selected.id);
+                              setBacklinks(links);
                               message.success(t("workspace.notes_saved"));
                             } finally {
                               setNoteSaving(false);
@@ -2077,6 +2116,120 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
                         >
                           {t("workspace.save_notes")}
                         </Button>
+                      </Space>
+                    )
+                  },
+                  {
+                    key: "schema",
+                    label: t("workspace.schema_tab"),
+                    children: (
+                      <Space direction="vertical" size="small" style={{ width: "100%" }}>
+                        <Input.Search
+                          value={schemaKeyword}
+                          onChange={(e) => setSchemaKeyword(e.target.value)}
+                          placeholder={t("workspace.schema_search")}
+                          enterButton={t("search.run")}
+                          onSearch={async (value) => {
+                            const keyword = value.trim();
+                            if (!keyword) {
+                              setSchemaSearchResults([]);
+                              return;
+                            }
+                            const res = await searchSchemas(keyword, 30);
+                            setSchemaSearchResults(res.items);
+                          }}
+                        />
+                        <Space size="small" wrap>
+                          <Button
+                            loading={schemaLoading}
+                            onClick={async () => {
+                              if (!selected) return;
+                              setSchemaLoading(true);
+                              try {
+                                const schema = await extractPaperSchema(selected.id, true);
+                                setPaperSchema(schema);
+                                message.success(t("workspace.schema_extract_ok"));
+                              } catch (err: any) {
+                                message.error(err?.response?.data?.detail || t("workspace.schema_extract_fail"));
+                              } finally {
+                                setSchemaLoading(false);
+                              }
+                            }}
+                          >
+                            {t("workspace.schema_extract")}
+                          </Button>
+                          {paperSchema?.confidence != null && (
+                            <Tag color="blue">
+                              {t("workspace.schema_confidence")}: {Number(paperSchema.confidence).toFixed(2)}
+                            </Tag>
+                          )}
+                          {paperSchema?.source && <Tag>{paperSchema.source}</Tag>}
+                        </Space>
+                        <div>
+                          <Text type="secondary">{t("workspace.schema_event_types")}</Text>
+                          <List
+                            size="small"
+                            dataSource={paperSchema?.event_types || []}
+                            locale={{ emptyText: t("workspace.schema_empty_event_types") }}
+                            renderItem={(item) => (
+                              <List.Item>
+                                <Space direction="vertical" size={0}>
+                                  <Text strong>{item.name}</Text>
+                                  {item.roles && item.roles.length > 0 && (
+                                    <Space size="small" wrap>
+                                      {item.roles.slice(0, 10).map((role) => (
+                                        <Tag key={`${item.name}-${role}`}>{role}</Tag>
+                                      ))}
+                                    </Space>
+                                  )}
+                                </Space>
+                              </List.Item>
+                            )}
+                          />
+                        </div>
+                        <div>
+                          <Text type="secondary">{t("workspace.schema_role_types")}</Text>
+                          <Space size="small" wrap style={{ marginTop: 6 }}>
+                            {(paperSchema?.role_types || []).map((role) => (
+                              <Tag key={`role-${role}`}>{role}</Tag>
+                            ))}
+                          </Space>
+                        </div>
+                        {schemaSearchResults.length > 0 && (
+                          <div>
+                            <Text type="secondary">{t("workspace.schema_matches")}</Text>
+                            <List
+                              size="small"
+                              dataSource={schemaSearchResults}
+                              renderItem={(row) => (
+                                <List.Item
+                                  actions={[
+                                    <Button
+                                      key="select"
+                                      size="small"
+                                      onClick={() => {
+                                        const node = graph?.nodes.find((n) => n.id === row.paper_id);
+                                        if (node) {
+                                          setSelected(node);
+                                          setZoteroKey(node.zotero_item_key || "");
+                                        }
+                                      }}
+                                    >
+                                      {t("workspace.schema_select")}
+                                    </Button>
+                                  ]}
+                                >
+                                  <Space direction="vertical" size={0}>
+                                    <Text>{row.title || `#${row.paper_id}`}</Text>
+                                    <Text type="secondary">
+                                      {row.year || "-"} · {row.sub_field || "-"}
+                                    </Text>
+                                  </Space>
+                                </List.Item>
+                              )}
+                            />
+                          </div>
+                        )}
                       </Space>
                     )
                   },
@@ -2161,6 +2314,46 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
                     )
                   },
                   {
+                    key: "backlinks",
+                    label: t("workspace.backlinks_tab"),
+                    children: (
+                      <Space direction="vertical" size="small" style={{ width: "100%" }}>
+                        <Text type="secondary">{t("workspace.backlinks_hint")}</Text>
+                        <List
+                          size="small"
+                          dataSource={backlinks?.items || []}
+                          locale={{ emptyText: t("workspace.backlinks_empty") }}
+                          renderItem={(item) => (
+                            <List.Item
+                              actions={[
+                                <Button
+                                  key="jump"
+                                  size="small"
+                                  onClick={() => {
+                                    const node = graph?.nodes.find((n) => n.id === item.source_paper_id);
+                                    if (node) {
+                                      setSelected(node);
+                                      setZoteroKey(node.zotero_item_key || "");
+                                    }
+                                  }}
+                                >
+                                  {t("workspace.backlinks_jump")}
+                                </Button>
+                              ]}
+                            >
+                              <Space direction="vertical" size={0}>
+                                <Text>{item.source_title || `#${item.source_paper_id}`}</Text>
+                                <Text type="secondary">
+                                  [[{item.link_text}]] · {item.source_year || "-"} · {item.source_sub_field || "-"}
+                                </Text>
+                              </Space>
+                            </List.Item>
+                          )}
+                        />
+                      </Space>
+                    )
+                  },
+                  {
                     key: "experiments",
                     label: t("workspace.experiments"),
                     children: (
@@ -2185,19 +2378,19 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
                           <Input
                             value={expDataset}
                             onChange={(e) => setExpDataset(e.target.value)}
-                            placeholder="Dataset (ACE2005)"
+                            placeholder={t("workspace.exp_dataset")}
                             style={{ width: 150 }}
                           />
                           <Input
                             value={expSplit}
                             onChange={(e) => setExpSplit(e.target.value)}
-                            placeholder="Split (test)"
+                            placeholder={t("workspace.exp_split")}
                             style={{ width: 120 }}
                           />
                           <Input
                             value={expMetricName}
                             onChange={(e) => setExpMetricName(e.target.value)}
-                            placeholder="Metric (F1)"
+                            placeholder={t("workspace.exp_metric_name")}
                             style={{ width: 120 }}
                           />
                           <InputNumber
@@ -2206,11 +2399,11 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
                             min={0}
                             max={100}
                             step={0.1}
-                            placeholder="Value"
+                            placeholder={t("workspace.exp_metric_value")}
                             style={{ width: 110 }}
                           />
                           <Switch checked={expIsSota} onChange={setExpIsSota} />
-                          <Text type="secondary">SOTA</Text>
+                          <Text type="secondary">{t("workspace.exp_sota")}</Text>
                         </Space>
                         <Button
                           loading={experimentLoading}
@@ -2281,6 +2474,57 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
                                   </Text>
                                 )}
                                 {item.metrics_json && <Text type="secondary">{item.metrics_json}</Text>}
+                              </Space>
+                            </List.Item>
+                          )}
+                        />
+                      </Space>
+                    )
+                  },
+                  {
+                    key: "leaderboard",
+                    label: t("workspace.leaderboard_tab"),
+                    children: (
+                      <Space direction="vertical" size="small" style={{ width: "100%" }}>
+                        <Space size="small" wrap>
+                          <Select
+                            value={metricType}
+                            onChange={(value) =>
+                              setMetricType(
+                                value as "f1" | "precision" | "recall" | "trigger_f1" | "argument_f1"
+                              )
+                            }
+                            options={[
+                              { label: "F1", value: "f1" },
+                              { label: "Precision", value: "precision" },
+                              { label: "Recall", value: "recall" },
+                              { label: "Trigger F1", value: "trigger_f1" },
+                              { label: "Argument F1", value: "argument_f1" }
+                            ]}
+                            style={{ width: 140 }}
+                          />
+                          <Button
+                            onClick={async () => {
+                              const data = await fetchMetricLeaderboard({ metric: metricType, limit: 30 });
+                              setMetricLeaderboard(data);
+                            }}
+                          >
+                            {t("btn.refresh")}
+                          </Button>
+                        </Space>
+                        <List
+                          size="small"
+                          dataSource={metricLeaderboard?.top_items || []}
+                          locale={{ emptyText: t("workspace.leaderboard_empty") }}
+                          renderItem={(item, idx) => (
+                            <List.Item>
+                              <Space direction="vertical" size={0}>
+                                <Text>
+                                  #{idx + 1} {item.title || `#${item.paper_id}`}
+                                </Text>
+                                <Text type="secondary">
+                                  {item.dataset_name || "-"} · {item.metric_value ?? "-"} · {item.year || "-"}
+                                </Text>
                               </Space>
                             </List.Item>
                           )}

@@ -31,6 +31,7 @@ class MetadataSchema(BaseModel):
     doi: Optional[str] = None
     abstract: Optional[str] = None
     sub_field: Optional[str] = None
+    open_sub_field: Optional[str] = None
     proposed_method_name: Optional[str] = None
     dynamic_tags: Optional[List[str]] = None
 
@@ -39,6 +40,19 @@ class ReferenceSchema(BaseModel):
     title: Optional[str] = None
     doi: Optional[str] = None
     year: Optional[int] = None
+
+
+class EventTypeSchema(BaseModel):
+    name: str
+    aliases: Optional[List[str]] = None
+    roles: Optional[List[str]] = None
+
+
+class EventSchemaResult(BaseModel):
+    event_types: List[EventTypeSchema] = []
+    role_types: List[str] = []
+    schema_notes: Optional[str] = None
+    confidence: float = 0.5
 
 
 def _build_prompt(
@@ -58,9 +72,10 @@ def _build_prompt(
         example_block = "\n".join(lines) + "\n\n"
     return (
         "You are extracting metadata from an academic paper. "
-        f"{prefix} Keys: title, authors, year, journal_conf, doi, abstract, sub_field, proposed_method_name, dynamic_tags.\n"
+        f"{prefix} Keys: title, authors, year, journal_conf, doi, abstract, sub_field, open_sub_field, proposed_method_name, dynamic_tags.\n"
         "If unsure, use null. For authors, return a comma-separated string.\n"
         f"Choose sub_field from: [{fields}]. If none match, return null.\n"
+        "If sub_field is null, suggest open_sub_field with a concise new direction name.\n"
         "For dynamic_tags, return 3-8 concise open-set tags (strings) for problem setting/method/data.\n"
         "For proposed_method_name, return the method/model name if present.\n\n"
         f"{example_block}TEXT:\n{raw_text[:12000]}"
@@ -92,6 +107,7 @@ def _normalize(data: Dict[str, Any], sub_fields: list[str]) -> Dict[str, Any]:
         "doi",
         "abstract",
         "sub_field",
+        "open_sub_field",
         "proposed_method_name",
     ]:
         value = data.get(key)
@@ -131,6 +147,9 @@ def _normalize(data: Dict[str, Any], sub_fields: list[str]) -> Dict[str, Any]:
             if out["sub_field"].lower() == option.lower():
                 out["sub_field"] = option
                 break
+    if out.get("open_sub_field") and out.get("sub_field"):
+        if out["open_sub_field"].strip().lower() == out["sub_field"].strip().lower():
+            out["open_sub_field"] = None
     return out
 
 
@@ -287,6 +306,121 @@ def summarize_one_line(title: Optional[str], abstract: Optional[str]) -> Optiona
     # Try to strip quotes if returned as JSON string
     content = content.strip().strip("\"")
     return content[:300]
+
+
+def _fallback_event_schema(raw_text: str, max_types: int = 24) -> Dict[str, Any]:
+    text = raw_text or ""
+    role_candidates = [
+        "Agent",
+        "Victim",
+        "Target",
+        "Attacker",
+        "Instrument",
+        "Time",
+        "Place",
+        "Location",
+        "Entity",
+        "Argument",
+        "Trigger",
+    ]
+    event_candidates = [
+        "Attack",
+        "Conflict",
+        "Movement",
+        "Transaction",
+        "Contact",
+        "Life",
+        "Personnel",
+        "Justice",
+        "Business",
+        "Artifact",
+        "Generic Event",
+        "Nested Event",
+    ]
+    events: List[Dict[str, Any]] = []
+    seen = set()
+    for event in event_candidates:
+        if event.lower() in text.lower():
+            seen.add(event.lower())
+            events.append({"name": event, "aliases": [], "roles": []})
+        if len(events) >= max_types:
+            break
+
+    role_found = [r for r in role_candidates if r.lower() in text.lower()]
+    return {
+        "event_types": events[:max_types],
+        "role_types": role_found[:24],
+        "schema_notes": "fallback_regex",
+        "confidence": 0.35,
+    }
+
+
+def extract_event_schema(raw_text: str, max_types: int = 24) -> Dict[str, Any]:
+    provider = os.getenv("LLM_PROVIDER", "").strip().lower()
+    api_key = os.getenv("LLM_API_KEY", "").strip()
+    endpoint = os.getenv("LLM_ENDPOINT", "").strip()
+    model = os.getenv("LLM_MODEL", "").strip()
+    if not raw_text.strip():
+        return {"event_types": [], "role_types": [], "schema_notes": None, "confidence": 0.0}
+
+    if not provider or not api_key or not endpoint or not model:
+        return _fallback_event_schema(raw_text, max_types=max_types)
+
+    headers = {"Authorization": f"Bearer {api_key}"}
+    prompt = (
+        "Extract event schema from paper text.\n"
+        "Return JSON object with keys:\n"
+        "event_types: [{name, aliases, roles}],\n"
+        "role_types: [string],\n"
+        "schema_notes: string,\n"
+        "confidence: float in [0,1].\n"
+        f"Limit event_types <= {max_types}. Keep names concise and deduplicated.\n\n"
+        f"TEXT:\n{raw_text[:18000]}"
+    )
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You extract event schemas for information extraction papers."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.1,
+    }
+    if os.getenv("LLM_RESPONSE_JSON", "").strip().lower() == "true":
+        payload["response_format"] = {"type": "json_object"}
+    try:
+        content = _call_llm(endpoint, headers, payload)
+        parsed = _parse_json(content)
+        if not isinstance(parsed, dict):
+            return _fallback_event_schema(raw_text, max_types=max_types)
+        event_types = parsed.get("event_types") or []
+        role_types = parsed.get("role_types") or []
+        normalized_events: List[Dict[str, Any]] = []
+        for item in event_types[:max_types]:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            aliases = item.get("aliases") if isinstance(item.get("aliases"), list) else []
+            roles = item.get("roles") if isinstance(item.get("roles"), list) else []
+            normalized_events.append(
+                {
+                    "name": name[:80],
+                    "aliases": [str(x).strip()[:80] for x in aliases if str(x).strip()][:8],
+                    "roles": [str(x).strip()[:80] for x in roles if str(x).strip()][:20],
+                }
+            )
+        normalized_roles = [str(x).strip()[:80] for x in role_types if str(x).strip()][:40]
+        result = {
+            "event_types": normalized_events,
+            "role_types": list(dict.fromkeys(normalized_roles)),
+            "schema_notes": (parsed.get("schema_notes") or "")[:500],
+            "confidence": float(parsed.get("confidence") or 0.6),
+        }
+        validated = EventSchemaResult.model_validate(result)
+        return validated.model_dump()
+    except Exception:
+        return _fallback_event_schema(raw_text, max_types=max_types)
 
 
 def _prepare_chat_context(

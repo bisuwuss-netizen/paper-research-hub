@@ -37,6 +37,7 @@ class Paper(BaseModel):
     proposed_method_name: str | None = None
     dynamic_tags: str | None = None
     embedding: str | None = None
+    open_sub_field: str | None = None
 
 
 class PaperCreate(BaseModel):
@@ -72,6 +73,7 @@ class PaperCreate(BaseModel):
     proposed_method_name: str | None = None
     dynamic_tags: str | None = None
     embedding: str | None = None
+    open_sub_field: str | None = None
 
 
 class PaperUpdate(BaseModel):
@@ -83,6 +85,7 @@ class PaperUpdate(BaseModel):
     summary_one: str | None = None
     proposed_method_name: str | None = None
     dynamic_tags: str | None = None
+    open_sub_field: str | None = None
 
 
 class PaperNote(BaseModel):
