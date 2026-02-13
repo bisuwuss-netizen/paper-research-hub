@@ -32,3 +32,5 @@ backend/storage
 *.sw?
 __pycache__/
 *.pyc
+frontend/playwright-report
+frontend/test-results

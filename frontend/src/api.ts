@@ -75,6 +75,8 @@ export type GraphEdge = {
   edge_source?: string | null;
   intent?: string | null;
   intent_confidence?: number | null;
+  context_snippet?: string | null;
+  intent_source?: string | null;
 };
 
 export type GraphResponse = {
@@ -108,6 +110,11 @@ export type Subfield = {
 };
 
 export type SyncStatus = Record<string, number>;
+
+export type SyncStatusResponse = SyncStatus & {
+  jobs?: Record<string, number>;
+  alerts_open?: number;
+};
 
 export type PaperNote = {
   paper_id: number;
@@ -243,6 +250,9 @@ export type ChatWithPapersResponse = {
     chunk_index?: number;
   }>;
   context_count: number;
+  trace_score?: number;
+  session_id?: number | null;
+  routes?: string[];
 };
 
 export type SotaBoard = {
@@ -276,6 +286,13 @@ export type MetricLeaderboard = {
     paper_id: number;
     dataset_name?: string | null;
     metric_value?: number | null;
+    table_id?: string | null;
+    row_index?: number | null;
+    col_index?: number | null;
+    cell_text?: string | null;
+    provenance?: Record<string, any>;
+    source?: string | null;
+    confidence?: number | null;
     title?: string | null;
     year?: number | null;
     sub_field?: string | null;
@@ -287,6 +304,82 @@ export type MetricLeaderboard = {
     avg_value?: number | null;
     sample_count: number;
   }>;
+};
+
+export type MetricProvenance = {
+  items: Array<{
+    id: number;
+    paper_id: number;
+    metric_key?: string | null;
+    metric_value?: number | null;
+    dataset_name?: string | null;
+    table_id?: string | null;
+    row_index?: number | null;
+    col_index?: number | null;
+    cell_text?: string | null;
+    parser?: string | null;
+    confidence?: number | null;
+    created_at?: number | null;
+  }>;
+  count: number;
+};
+
+export type ChatSession = {
+  id: number;
+  title?: string | null;
+  language?: string | null;
+  created_at?: number | null;
+  updated_at?: number | null;
+};
+
+export type ChatMessage = {
+  id: number;
+  session_id: number;
+  role: string;
+  content: string;
+  paper_ids?: number[];
+  trace_score?: number | null;
+  sources?: Array<Record<string, any>>;
+  created_at?: number | null;
+};
+
+export type IdeaCapsule = {
+  id: number;
+  title: string;
+  content: string;
+  status: "seed" | "incubating" | "validated" | "archived" | string;
+  priority: number;
+  linked_papers: number[];
+  tags: string[];
+  source_note_paper_id?: number | null;
+  created_at?: number | null;
+  updated_at?: number | null;
+};
+
+export type JobRun = {
+  id: number;
+  job_type: string;
+  status: string;
+  payload?: Record<string, any>;
+  result?: Record<string, any>;
+  attempts?: number;
+  error?: string | null;
+  started_at?: number | null;
+  finished_at?: number | null;
+  next_retry_at?: number | null;
+  created_at?: number | null;
+  updated_at?: number | null;
+};
+
+export type JobAlert = {
+  id: number;
+  level?: string;
+  source_job_id?: number | null;
+  message?: string | null;
+  payload?: Record<string, any>;
+  resolved?: number;
+  created_at?: number | null;
+  resolved_at?: number | null;
 };
 
 export type OpenTagDiscovery = {
@@ -505,7 +598,7 @@ export async function zoteroSyncIds(limit = 50): Promise<{ synced: number }> {
   return res.data;
 }
 
-export async function fetchSyncStatus(): Promise<SyncStatus> {
+export async function fetchSyncStatus(): Promise<SyncStatusResponse> {
   const res = await axios.get(`${API_BASE}/api/sync/status`);
   return res.data;
 }
@@ -538,6 +631,7 @@ export async function backfillPapers(params?: {
   references_parsed: number;
   chunks_indexed?: number;
   metrics_upserted?: number;
+  metric_cells_upserted?: number;
   auto_experiments?: number;
   schemas_extracted?: number;
 }> {
@@ -739,6 +833,8 @@ export async function chatWithPapers(payload: {
   paper_ids?: number[];
   top_k?: number;
   language?: "zh" | "en";
+  session_id?: number;
+  use_memory?: boolean;
 }): Promise<ChatWithPapersResponse> {
   const res = await axios.post(`${API_BASE}/api/chat/papers`, payload);
   return res.data;
@@ -750,11 +846,19 @@ export async function streamChatWithPapers(
     paper_ids?: number[];
     top_k?: number;
     language?: "zh" | "en";
+    session_id?: number;
+    use_memory?: boolean;
   },
   handlers: {
-    onMeta?: (meta: { query: string; paper_ids: number[]; context_count: number }) => void;
+    onMeta?: (meta: {
+      query: string;
+      paper_ids: number[];
+      context_count: number;
+      session_id?: number;
+      routes?: string[];
+    }) => void;
     onDelta?: (delta: string) => void;
-    onSources?: (sources: ChatWithPapersResponse["sources"]) => void;
+    onSources?: (sources: ChatWithPapersResponse["sources"], traceScore?: number) => void;
     onDone?: () => void;
   }
 ): Promise<void> {
@@ -792,12 +896,14 @@ export async function streamChatWithPapers(
         handlers.onMeta?.({
           query: event.query || "",
           paper_ids: event.paper_ids || [],
-          context_count: event.context_count || 0
+          context_count: event.context_count || 0,
+          session_id: event.session_id,
+          routes: event.routes || []
         });
       } else if (event.type === "delta") {
         handlers.onDelta?.(event.delta || "");
       } else if (event.type === "sources") {
-        handlers.onSources?.(event.sources || []);
+        handlers.onSources?.(event.sources || [], event.trace_score);
       } else if (event.type === "done") {
         handlers.onDone?.();
       }
@@ -819,6 +925,15 @@ export async function fetchMetricLeaderboard(params?: {
   limit?: number;
 }): Promise<MetricLeaderboard> {
   const res = await axios.get(`${API_BASE}/api/metrics/leaderboard`, { params });
+  return res.data;
+}
+
+export async function fetchMetricProvenance(params?: {
+  paper_id?: number;
+  dataset?: string;
+  limit?: number;
+}): Promise<MetricProvenance> {
+  const res = await axios.get(`${API_BASE}/api/metrics/provenance`, { params });
   return res.data;
 }
 
@@ -898,5 +1013,121 @@ export async function syncZoteroIncremental(payload: {
   limit?: number;
 }): Promise<{ synced: number; conflicts: number }> {
   const res = await axios.post(`${API_BASE}/api/zotero/sync-incremental`, payload);
+  return res.data;
+}
+
+export async function createChatSession(payload?: {
+  title?: string;
+  language?: "zh" | "en";
+}): Promise<ChatSession> {
+  const res = await axios.post(`${API_BASE}/api/chat/sessions`, payload || {});
+  return res.data;
+}
+
+export async function fetchChatSessions(limit = 20): Promise<ChatSession[]> {
+  const res = await axios.get(`${API_BASE}/api/chat/sessions`, { params: { limit } });
+  return res.data;
+}
+
+export async function fetchChatMessages(sessionId: number, limit = 100): Promise<ChatMessage[]> {
+  const res = await axios.get(`${API_BASE}/api/chat/sessions/${sessionId}/messages`, { params: { limit } });
+  return res.data;
+}
+
+export async function fetchIdeaCapsules(params?: {
+  status?: string;
+  paper_id?: number;
+  limit?: number;
+}): Promise<{ items: IdeaCapsule[]; count: number }> {
+  const res = await axios.get(`${API_BASE}/api/idea-capsules`, { params });
+  return res.data;
+}
+
+export async function fetchIdeaCapsuleBoard(): Promise<{
+  board: Record<string, IdeaCapsule[]>;
+  summary: Record<string, number>;
+}> {
+  const res = await axios.get(`${API_BASE}/api/idea-capsules/board`);
+  return res.data;
+}
+
+export async function createIdeaCapsule(payload: {
+  title: string;
+  content: string;
+  status?: string;
+  priority?: number;
+  linked_papers?: number[];
+  tags?: string[];
+  source_note_paper_id?: number;
+}): Promise<IdeaCapsule> {
+  const res = await axios.post(`${API_BASE}/api/idea-capsules`, payload);
+  return res.data;
+}
+
+export async function updateIdeaCapsule(
+  capsuleId: number,
+  payload: Partial<{
+    title: string;
+    content: string;
+    status: string;
+    priority: number;
+    linked_papers: number[];
+    tags: string[];
+  }>
+): Promise<IdeaCapsule> {
+  const res = await axios.patch(`${API_BASE}/api/idea-capsules/${capsuleId}`, payload);
+  return res.data;
+}
+
+export async function deleteIdeaCapsule(capsuleId: number): Promise<void> {
+  await axios.delete(`${API_BASE}/api/idea-capsules/${capsuleId}`);
+}
+
+export async function fetchJobHistory(params?: {
+  status?: string;
+  limit?: number;
+}): Promise<{ items: JobRun[]; count: number }> {
+  const res = await axios.get(`${API_BASE}/api/jobs/history`, { params });
+  return res.data;
+}
+
+export async function retryJob(jobId: number): Promise<{ job_id: number; status: string; payload?: Record<string, any> }> {
+  const res = await axios.post(`${API_BASE}/api/jobs/${jobId}/retry`);
+  return res.data;
+}
+
+export async function runQueuedJobs(limit = 5): Promise<{ executed: number; failed: number }> {
+  const res = await axios.post(`${API_BASE}/api/jobs/run-queued`, null, { params: { limit } });
+  return res.data;
+}
+
+export async function fetchJobAlerts(params?: {
+  resolved?: boolean;
+  limit?: number;
+}): Promise<{ items: JobAlert[]; count: number }> {
+  const res = await axios.get(`${API_BASE}/api/jobs/alerts`, { params });
+  return res.data;
+}
+
+export async function resolveJobAlert(alertId: number): Promise<{ status: string; id: number }> {
+  const res = await axios.post(`${API_BASE}/api/jobs/alerts/${alertId}/resolve`);
+  return res.data;
+}
+
+export async function fetchSchemaOntology(min_support = 2): Promise<{
+  nodes: Array<{ id: number; name: string; type: string; aliases: string[]; paper_count: number }>;
+  edges: Array<{ source: number; target: number; co_count: number }>;
+  count: number;
+}> {
+  const res = await axios.get(`${API_BASE}/api/schemas/ontology`, { params: { min_support } });
+  return res.data;
+}
+
+export async function alignSchemaOntology(limit = 500): Promise<{
+  papers_processed: number;
+  aligned_links: number;
+  concepts: number;
+}> {
+  const res = await axios.post(`${API_BASE}/api/schemas/align`, null, { params: { limit } });
   return res.data;
 }

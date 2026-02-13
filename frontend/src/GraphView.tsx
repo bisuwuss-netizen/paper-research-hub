@@ -60,12 +60,29 @@ import {
   classifyCitationIntent,
   chatWithPapers,
   streamChatWithPapers,
+  createChatSession,
+  fetchChatMessages,
+  fetchChatSessions,
+  fetchIdeaCapsuleBoard,
+  fetchIdeaCapsules,
+  createIdeaCapsule,
+  updateIdeaCapsule,
+  deleteIdeaCapsule,
+  fetchJobAlerts,
+  fetchJobHistory,
+  resolveJobAlert,
+  retryJob,
+  runQueuedJobs,
+  fetchMetricProvenance,
+  fetchSchemaOntology,
+  alignSchemaOntology,
   discoverOpenTags,
   fetchMetricLeaderboard,
+  searchPapers,
   type GraphNode,
   type GraphResponse,
   type Subfield,
-  type SyncStatus,
+  type SyncStatusResponse,
   type PaperNote,
   type PaperSchema,
   type BacklinksResponse,
@@ -73,7 +90,13 @@ import {
   type Experiment,
   type ComparePapersResponse,
   type ChatWithPapersResponse,
-  type MetricLeaderboard
+  type MetricLeaderboard,
+  type MetricProvenance,
+  type IdeaCapsule,
+  type JobAlert,
+  type JobRun,
+  type ChatMessage,
+  type ChatSession
 } from "./api";
 
 const { Title, Text, Paragraph } = Typography;
@@ -122,7 +145,7 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
   const [newSubfieldName, setNewSubfieldName] = useState("");
   const [openTagLoading, setOpenTagLoading] = useState(false);
   const [openTagCandidates, setOpenTagCandidates] = useState<string[]>([]);
-  const [syncStatus, setSyncStatus] = useState<SyncStatus>({});
+  const [syncStatus, setSyncStatus] = useState<SyncStatusResponse>({});
   const [syncLimit, setSyncLimit] = useState(5);
   const [syncBusy, setSyncBusy] = useState(false);
   const [zoteroLimit, setZoteroLimit] = useState(20);
@@ -176,6 +199,50 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
   const [qaMode, setQaMode] = useState<"single" | "compare">("single");
   const [qaLoading, setQaLoading] = useState(false);
   const [qaResult, setQaResult] = useState<ChatWithPapersResponse | null>(null);
+  const [chatSessionId, setChatSessionId] = useState<number | undefined>();
+  const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
+  const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
+  const [workbenchTab, setWorkbenchTab] = useState<
+    | "chat"
+    | "search"
+    | "notes"
+    | "schema"
+    | "tasks"
+    | "backlinks"
+    | "experiments"
+    | "leaderboard"
+    | "comparison"
+    | "capsules"
+    | "jobs"
+  >("chat");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchResults, setSearchResults] = useState<
+    Array<{
+      paper: { id: number; title?: string | null; year?: number | null; sub_field?: string | null };
+      score: number;
+      bm25_score: number;
+      semantic_score: number;
+      snippet?: string;
+    }>
+  >([]);
+  const [metricProvenance, setMetricProvenance] = useState<MetricProvenance | null>(null);
+  const [schemaOntology, setSchemaOntology] = useState<{
+    nodes: Array<{ id: number; name: string; type: string; aliases: string[]; paper_count: number }>;
+    edges: Array<{ source: number; target: number; co_count: number }>;
+    count: number;
+  } | null>(null);
+  const [capsules, setCapsules] = useState<IdeaCapsule[]>([]);
+  const [capsuleTitle, setCapsuleTitle] = useState("");
+  const [capsuleContent, setCapsuleContent] = useState("");
+  const [capsuleStatus, setCapsuleStatus] = useState<"seed" | "incubating" | "validated" | "archived">("seed");
+  const [capsulePriority, setCapsulePriority] = useState(2);
+  const [capsuleTags, setCapsuleTags] = useState("");
+  const [capsuleLoading, setCapsuleLoading] = useState(false);
+  const [capsuleBoard, setCapsuleBoard] = useState<Record<string, IdeaCapsule[]>>({});
+  const [jobRuns, setJobRuns] = useState<JobRun[]>([]);
+  const [jobAlerts, setJobAlerts] = useState<JobAlert[]>([]);
+  const [jobLoading, setJobLoading] = useState(false);
   const [menu, setMenu] = useState<{ visible: boolean; x: number; y: number; node: GraphNode | null }>({
     visible: false,
     x: 0,
@@ -341,10 +408,52 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     }
   };
 
+  const refreshJobBoard = async () => {
+    setJobLoading(true);
+    try {
+      const [jobs, alerts] = await Promise.all([fetchJobHistory({ limit: 80 }), fetchJobAlerts({ resolved: false, limit: 80 })]);
+      setJobRuns(jobs.items);
+      setJobAlerts(alerts.items);
+    } catch {
+      // ignore
+    } finally {
+      setJobLoading(false);
+    }
+  };
+
+  const refreshCapsules = async () => {
+    try {
+      const [list, board] = await Promise.all([fetchIdeaCapsules({ limit: 200 }), fetchIdeaCapsuleBoard()]);
+      setCapsules(list.items);
+      setCapsuleBoard(board.board || {});
+    } catch {
+      // ignore
+    }
+  };
+
+  const refreshChatSessions = async () => {
+    try {
+      const sessions = await fetchChatSessions(30);
+      setChatSessions(sessions);
+      if (!chatSessionId && sessions.length > 0) {
+        setChatSessionId(sessions[0].id);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
   useEffect(() => {
     refreshSyncStatus();
+    refreshJobBoard();
+    refreshCapsules();
+    refreshChatSessions();
     const id = window.setInterval(refreshSyncStatus, 10000);
-    return () => window.clearInterval(id);
+    const jobId = window.setInterval(refreshJobBoard, 15000);
+    return () => {
+      window.clearInterval(id);
+      window.clearInterval(jobId);
+    };
   }, []);
 
   useEffect(() => {
@@ -355,6 +464,18 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [subfieldModalOpen]);
+
+  useEffect(() => {
+    if (!chatSessionId) {
+      setChatHistory([]);
+      return;
+    }
+    fetchChatMessages(chatSessionId, 200)
+      .then((rows) => setChatHistory(rows))
+      .catch(() => {
+        // ignore
+      });
+  }, [chatSessionId]);
 
   useEffect(() => {
     const hide = () => setMenu((prev) => ({ ...prev, visible: false }));
@@ -368,13 +489,14 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
 
   const loadNodeWorkspace = async (paperId: number) => {
     try {
-      const [noteData, taskData, experimentData, backlinkData, schemaData, metricData] = await Promise.all([
+      const [noteData, taskData, experimentData, backlinkData, schemaData, metricData, provenanceData] = await Promise.all([
         fetchPaperNotes(paperId),
         fetchTasks({ paper_id: paperId }),
         fetchExperiments({ paper_id: paperId }),
         fetchPaperBacklinks(paperId),
         fetchPaperSchema(paperId),
-        fetchMetricLeaderboard({ metric: metricType, limit: 20 })
+        fetchMetricLeaderboard({ metric: metricType, limit: 20 }),
+        fetchMetricProvenance({ paper_id: paperId, limit: 60 })
       ]);
       setNote(noteData);
       setTasks(taskData);
@@ -382,6 +504,7 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
       setBacklinks(backlinkData);
       setPaperSchema(schemaData);
       setMetricLeaderboard(metricData);
+      setMetricProvenance(provenanceData);
     } catch {
       // ignore
     }
@@ -394,6 +517,7 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
       setExperiments([]);
       setBacklinks(null);
       setPaperSchema(null);
+      setMetricProvenance(null);
       return;
     }
     loadNodeWorkspace(selected.id);
@@ -401,6 +525,15 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
       loadNeighbors();
     }
   }, [selected?.id, focusMode, metricType]);
+
+  useEffect(() => {
+    if (workbenchTab !== "schema") return;
+    fetchSchemaOntology(2)
+      .then((data) => setSchemaOntology(data))
+      .catch(() => {
+        // ignore
+      });
+  }, [workbenchTab]);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -415,19 +548,19 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
               "background-color": "data(color)",
               label: "data(displayLabel)",
               color: "#0f172a",
-              "font-size": 8,
+              "font-size": 6,
               "text-wrap": "wrap",
-              "text-max-width": "110",
-              "min-zoomed-font-size": 6,
+              "text-max-width": "78",
+              "min-zoomed-font-size": 5,
               width: "data(size)",
               height: "data(size)",
               "text-valign": "top",
               "text-halign": "center",
-              "text-margin-y": -8,
+              "text-margin-y": -5,
               "text-background-color": "#ffffff",
-              "text-background-opacity": 0.78,
-              "text-background-padding": "2",
-              "text-opacity": 0.95
+              "text-background-opacity": 0.62,
+              "text-background-padding": "1.5",
+              "text-opacity": 0.9
             }
           },
           {
@@ -1094,22 +1227,37 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
         sources: [],
         context_count: 0
       });
+      let activeSessionId = chatSessionId;
+      if (!activeSessionId) {
+        const session = await createChatSession({ title: query.slice(0, 40), language: "zh" });
+        activeSessionId = session.id;
+        setChatSessionId(session.id);
+        await refreshChatSessions();
+      }
       await streamChatWithPapers(
         {
           query,
           paper_ids: paperIds,
           top_k: 8,
-          language: navigator.language?.toLowerCase().startsWith("zh") ? "zh" : "en"
+          language: navigator.language?.toLowerCase().startsWith("zh") ? "zh" : "en",
+          session_id: activeSessionId,
+          use_memory: true
         },
         {
-          onMeta: (meta) =>
+          onMeta: (meta) => {
+            if (meta.session_id) {
+              setChatSessionId(meta.session_id);
+            }
             setQaResult((prev) => ({
               query: meta.query,
               paper_ids: meta.paper_ids,
               answer: prev?.answer ?? "",
               sources: prev?.sources ?? [],
-              context_count: meta.context_count
-            })),
+              context_count: meta.context_count,
+              session_id: meta.session_id,
+              routes: meta.routes
+            }));
+          },
           onDelta: (delta) =>
             setQaResult((prev) => ({
               query,
@@ -1118,14 +1266,21 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
               sources: prev?.sources || [],
               context_count: prev?.context_count || 0
             })),
-          onSources: (sources) =>
+          onSources: (sources, traceScore) =>
             setQaResult((prev) => ({
               query,
               paper_ids: paperIds,
               answer: prev?.answer || "",
               sources,
-              context_count: prev?.context_count || 0
-            }))
+              context_count: prev?.context_count || 0,
+              trace_score: traceScore
+            })),
+          onDone: async () => {
+            if (activeSessionId) {
+              const rows = await fetchChatMessages(activeSessionId, 120);
+              setChatHistory(rows);
+            }
+          }
         }
       );
     } catch {
@@ -1134,9 +1289,16 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
         query,
         paper_ids: paperIds,
         top_k: 8,
-        language: navigator.language?.toLowerCase().startsWith("zh") ? "zh" : "en"
+        language: navigator.language?.toLowerCase().startsWith("zh") ? "zh" : "en",
+        session_id: chatSessionId,
+        use_memory: true
       });
       setQaResult(result);
+      if (result.session_id) {
+        setChatSessionId(result.session_id);
+        const rows = await fetchChatMessages(result.session_id, 120);
+        setChatHistory(rows);
+      }
     } finally {
       setQaLoading(false);
     }
@@ -1506,6 +1668,10 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
         <Tag color="red">
           {t("sync.failed")} {syncStatus.failed ?? 0}
         </Tag>
+        <Tag color="purple">jobs {Object.values(syncStatus.jobs || {}).reduce((acc, cur) => acc + Number(cur || 0), 0)}</Tag>
+        <Tag color={(syncStatus.alerts_open ?? 0) > 0 ? "red" : "green"}>
+          alerts {syncStatus.alerts_open ?? 0}
+        </Tag>
       </Space>
     </Space>
   );
@@ -1566,6 +1732,16 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
           value={syncLimit}
           onChange={(value) => setSyncLimit(value ?? 5)}
         />
+        <Button
+          onClick={async () => {
+            const res = await runQueuedJobs(syncLimit);
+            message.success(`jobs ${res.executed}`);
+            refreshJobBoard();
+            refreshSyncStatus();
+          }}
+        >
+          {t("workspace.jobs_run")}
+        </Button>
       </Space>
       <Button
         onClick={async () => {
@@ -1630,7 +1806,7 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
                 force: false
               });
               message.success(
-                `${t("backfill.result")}: ${res.processed}, ${t("backfill.summaries")} ${res.summary_added}, ${t("backfill.refs")} ${res.references_parsed}, schema ${res.schemas_extracted ?? 0}, exp ${res.auto_experiments ?? 0}`
+                `${t("backfill.result")}: ${res.processed}, ${t("backfill.summaries")} ${res.summary_added}, ${t("backfill.refs")} ${res.references_parsed}, schema ${res.schemas_extracted ?? 0}, exp ${res.auto_experiments ?? 0}, cells ${res.metric_cells_upserted ?? 0}`
               );
               fetchData(subField, yearRange);
             } finally {
@@ -1742,22 +1918,9 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
               {!selected && <Text type="secondary">{t("graph.relation_hint")}</Text>}
             </Space>
             <Space size="small" wrap>
-              <Select
-                allowClear
-                placeholder={t("graph.path_source")}
-                style={{ width: 160 }}
-                value={pathSourceId}
-                onChange={(value) => setPathSourceId(value)}
-                options={(graph?.nodes || []).map((n) => ({ label: shortLabel(n.label), value: n.id }))}
-              />
-              <Select
-                allowClear
-                placeholder={t("graph.path_target")}
-                style={{ width: 160 }}
-                value={pathTargetId}
-                onChange={(value) => setPathTargetId(value)}
-                options={(graph?.nodes || []).map((n) => ({ label: shortLabel(n.label), value: n.id }))}
-              />
+              <Tag>{t("graph.path_source")}: {pathSourceId || "-"}</Tag>
+              <Tag>{t("graph.path_target")}: {pathTargetId || "-"}</Tag>
+              <Text type="secondary">{t("graph.path_context_hint")}</Text>
               <Button loading={pathLoading} onClick={highlightShortestPath}>
                 {t("graph.shortest_path")}
               </Button>
@@ -1766,6 +1929,8 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
                   if (!cyRef.current) return;
                   cyRef.current.nodes().removeClass("path-step");
                   cyRef.current.edges().removeClass("path-edge");
+                  setPathSourceId(undefined);
+                  setPathTargetId(undefined);
                 }}
               >
                 {t("graph.clear_shortest_path")}
@@ -1842,8 +2007,52 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
           </div>
         </Card>
       </div>
-      <div className="graph-detail">
+      <div className="graph-inspector">
         <Card className="graph-card" title={t("details.title")} size="small">
+          {selected ? (
+            <Space direction="vertical" size="small" style={{ width: "100%" }}>
+              <Title level={5} style={{ margin: 0 }}>{shortLabel(selected.label)}</Title>
+              <Text type="secondary">{selected.authors || t("details.unknown_authors")}</Text>
+              <Space size="small" wrap>
+                {selected.year && <Tag>{selected.year}</Tag>}
+                {selected.sub_field && <Tag color="geekblue">{selected.sub_field}</Tag>}
+                {!selected.sub_field && selected.open_sub_field && <Tag color="magenta">{selected.open_sub_field}</Tag>}
+                {selected.ccf_level && <Tag color="red">CCF {selected.ccf_level}</Tag>}
+              </Space>
+              <Space size="small" wrap>
+                <Button
+                  size="small"
+                  onClick={async () => {
+                    if (!selected) return;
+                    const next = selected.read_status === 1 ? 0 : 1;
+                    const updated = await updatePaper(selected.id, { read_status: next });
+                    setSelected({ ...selected, read_status: updated.read_status ?? next });
+                    fetchData(subField, yearRange);
+                  }}
+                >
+                  {selected.read_status === 1 ? t("details.mark_unread") : t("details.mark_read")}
+                </Button>
+                <Button size="small" onClick={() => addToComparison(selected.id)}>
+                  {t("compare.add")}
+                </Button>
+                <Button size="small" onClick={() => setWorkbenchTab("chat")}>
+                  {t("qa.title")}
+                </Button>
+                <Button size="small" onClick={loadNeighbors}>
+                  {t("details.load_neighbors")}
+                </Button>
+              </Space>
+              <Paragraph ellipsis={{ rows: 3 }} style={{ marginBottom: 0 }}>
+                {selected.abstract || t("details.no_abstract")}
+              </Paragraph>
+            </Space>
+          ) : (
+            <Text type="secondary">{t("details.select_hint")}</Text>
+          )}
+        </Card>
+      </div>
+      <div className="graph-workbench">
+        <Card className="graph-card" title={t("graph.workbench")} size="small">
           {selected ? (
             <Space direction="vertical" size="small">
               <Title level={5}>{selected.label}</Title>
@@ -2033,7 +2242,85 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
               <Divider style={{ margin: "10px 0" }} />
               <Tabs
                 size="small"
+                activeKey={workbenchTab}
+                onChange={(key) =>
+                  setWorkbenchTab(
+                    key as
+                      | "chat"
+                      | "search"
+                      | "notes"
+                      | "schema"
+                      | "tasks"
+                      | "backlinks"
+                      | "experiments"
+                      | "leaderboard"
+                      | "comparison"
+                      | "capsules"
+                      | "jobs"
+                  )
+                }
                 items={[
+                  {
+                    key: "search",
+                    label: t("tab.search"),
+                    children: (
+                      <Space direction="vertical" size="small" style={{ width: "100%" }}>
+                        <Input.Search
+                          value={searchQuery}
+                          onChange={(e) => setSearchQuery(e.target.value)}
+                          placeholder={t("search.placeholder")}
+                          enterButton={t("search.run")}
+                          loading={searchLoading}
+                          onSearch={async (value) => {
+                            const q = value.trim();
+                            if (!q) {
+                              setSearchResults([]);
+                              return;
+                            }
+                            setSearchLoading(true);
+                            try {
+                              const data = await searchPapers(q, 20);
+                              setSearchResults(data.results);
+                            } finally {
+                              setSearchLoading(false);
+                            }
+                          }}
+                        />
+                        <List
+                          size="small"
+                          dataSource={searchResults}
+                          locale={{ emptyText: t("search.empty") }}
+                          renderItem={(item) => (
+                            <List.Item
+                              actions={[
+                                <Button
+                                  key="jump"
+                                  size="small"
+                                  onClick={() => {
+                                    const node = graph?.nodes.find((n) => n.id === item.paper.id);
+                                    if (node) {
+                                      setSelected(node);
+                                      setZoteroKey(node.zotero_item_key || "");
+                                    }
+                                  }}
+                                >
+                                  {t("workspace.schema_select")}
+                                </Button>
+                              ]}
+                            >
+                              <Space direction="vertical" size={0}>
+                                <Text>{item.paper.title || `#${item.paper.id}`}</Text>
+                                <Text type="secondary">
+                                  {item.paper.year || "-"} · {item.paper.sub_field || "-"} · {item.score.toFixed(3)}
+                                </Text>
+                                <Text type="secondary">{item.snippet || ""}</Text>
+                              </Space>
+                            </List.Item>
+                          )}
+                        />
+                      </Space>
+                    )
+                  },
                   {
                     key: "notes",
                     label: t("workspace.notes"),
@@ -2164,6 +2451,24 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
                             </Tag>
                           )}
                           {paperSchema?.source && <Tag>{paperSchema.source}</Tag>}
+                          <Button
+                            onClick={async () => {
+                              const res = await alignSchemaOntology(800);
+                              message.success(`aligned ${res.aligned_links}`);
+                              const graphData = await fetchSchemaOntology(2);
+                              setSchemaOntology(graphData);
+                            }}
+                          >
+                            {t("workspace.schema_align")}
+                          </Button>
+                          <Button
+                            onClick={async () => {
+                              const graphData = await fetchSchemaOntology(2);
+                              setSchemaOntology(graphData);
+                            }}
+                          >
+                            {t("workspace.schema_graph")}
+                          </Button>
                         </Space>
                         <div>
                           <Text type="secondary">{t("workspace.schema_event_types")}</Text>
@@ -2223,6 +2528,27 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
                                     <Text>{row.title || `#${row.paper_id}`}</Text>
                                     <Text type="secondary">
                                       {row.year || "-"} · {row.sub_field || "-"}
+                                    </Text>
+                                  </Space>
+                                </List.Item>
+                              )}
+                            />
+                          </div>
+                        )}
+                        {schemaOntology && (
+                          <div>
+                            <Text type="secondary">
+                              {t("workspace.schema_ontology")} · {schemaOntology.count}
+                            </Text>
+                            <List
+                              size="small"
+                              dataSource={schemaOntology.nodes.slice(0, 20)}
+                              renderItem={(node) => (
+                                <List.Item>
+                                  <Space direction="vertical" size={0}>
+                                    <Text>{node.name}</Text>
+                                    <Text type="secondary">
+                                      {node.type} · {node.paper_count}
                                     </Text>
                                   </Space>
                                 </List.Item>
@@ -2507,6 +2833,10 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
                             onClick={async () => {
                               const data = await fetchMetricLeaderboard({ metric: metricType, limit: 30 });
                               setMetricLeaderboard(data);
+                              if (selected) {
+                                const prov = await fetchMetricProvenance({ paper_id: selected.id, limit: 80 });
+                                setMetricProvenance(prov);
+                              }
                             }}
                           >
                             {t("btn.refresh")}
@@ -2525,7 +2855,25 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
                                 <Text type="secondary">
                                   {item.dataset_name || "-"} · {item.metric_value ?? "-"} · {item.year || "-"}
                                 </Text>
+                                {(item.table_id || item.cell_text) && (
+                                  <Text type="secondary">
+                                    {item.table_id || "-"} r{item.row_index ?? "-"} c{item.col_index ?? "-"} · {item.cell_text || "-"}
+                                  </Text>
+                                )}
                               </Space>
+                            </List.Item>
+                          )}
+                        />
+                        <List
+                          size="small"
+                          header={<Text type="secondary">{t("workspace.metric_provenance")}</Text>}
+                          dataSource={metricProvenance?.items || []}
+                          locale={{ emptyText: "-" }}
+                          renderItem={(item) => (
+                            <List.Item>
+                              <Text type="secondary">
+                                {item.metric_key}={item.metric_value} · {item.dataset_name} · {item.table_id} r{item.row_index}c{item.col_index}
+                              </Text>
                             </List.Item>
                           )}
                         />
@@ -2582,10 +2930,32 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
                     )
                   },
                   {
-                    key: "qa",
+                    key: "chat",
                     label: t("qa.title"),
                     children: (
                       <Space direction="vertical" size="small" style={{ width: "100%" }}>
+                        <Space size="small" wrap>
+                          <Select
+                            allowClear
+                            style={{ width: 200 }}
+                            value={chatSessionId}
+                            placeholder={t("qa.session")}
+                            options={chatSessions.map((session) => ({
+                              label: `#${session.id} ${session.title || ""}`.trim(),
+                              value: session.id
+                            }))}
+                            onChange={(value) => setChatSessionId(value)}
+                          />
+                          <Button
+                            onClick={async () => {
+                              const session = await createChatSession({ title: qaQuery.slice(0, 30), language: "zh" });
+                              setChatSessionId(session.id);
+                              await refreshChatSessions();
+                            }}
+                          >
+                            {t("qa.new_session")}
+                          </Button>
+                        </Space>
                         <Select
                           value={qaMode}
                           onChange={(value) => setQaMode(value as "single" | "compare")}
@@ -2603,9 +2973,27 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
                         <Button type="primary" onClick={askPaperQa} loading={qaLoading}>
                           {t("qa.ask")}
                         </Button>
+                        <List
+                          size="small"
+                          dataSource={chatHistory.slice(-6)}
+                          locale={{ emptyText: t("qa.history_empty") }}
+                          renderItem={(msg) => (
+                            <List.Item>
+                              <Space direction="vertical" size={0}>
+                                <Text strong>{msg.role === "assistant" ? "AI" : "You"}</Text>
+                                <Text type="secondary">{msg.content.slice(0, 200)}</Text>
+                              </Space>
+                            </List.Item>
+                          )}
+                        />
                         {qaResult && (
                           <>
                             <Paragraph style={{ whiteSpace: "pre-wrap" }}>{qaResult.answer}</Paragraph>
+                            {typeof qaResult.trace_score === "number" && (
+                              <Tag color={qaResult.trace_score >= 0.6 ? "green" : qaResult.trace_score >= 0.4 ? "gold" : "red"}>
+                                Traceability: {qaResult.trace_score.toFixed(2)}
+                              </Tag>
+                            )}
                             <List
                               size="small"
                               header={<Text type="secondary">{t("qa.sources")}</Text>}
@@ -2620,6 +3008,203 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
                             />
                           </>
                         )}
+                      </Space>
+                    )
+                  },
+                  {
+                    key: "capsules",
+                    label: t("workspace.capsules"),
+                    children: (
+                      <Space direction="vertical" size="small" style={{ width: "100%" }}>
+                        <Input
+                          value={capsuleTitle}
+                          onChange={(e) => setCapsuleTitle(e.target.value)}
+                          placeholder={t("workspace.capsule_title")}
+                        />
+                        <Input.TextArea
+                          value={capsuleContent}
+                          onChange={(e) => setCapsuleContent(e.target.value)}
+                          placeholder={t("workspace.capsule_content")}
+                          autoSize={{ minRows: 3, maxRows: 6 }}
+                        />
+                        <Space size="small" wrap>
+                          <Select
+                            value={capsuleStatus}
+                            style={{ width: 140 }}
+                            onChange={(value) =>
+                              setCapsuleStatus(value as "seed" | "incubating" | "validated" | "archived")
+                            }
+                            options={[
+                              { label: "seed", value: "seed" },
+                              { label: "incubating", value: "incubating" },
+                              { label: "validated", value: "validated" },
+                              { label: "archived", value: "archived" }
+                            ]}
+                          />
+                          <InputNumber min={1} max={5} value={capsulePriority} onChange={(value) => setCapsulePriority(value || 2)} />
+                          <Input
+                            value={capsuleTags}
+                            onChange={(e) => setCapsuleTags(e.target.value)}
+                            placeholder={t("workspace.capsule_tags")}
+                            style={{ width: 220 }}
+                          />
+                          <Button
+                            type="primary"
+                            loading={capsuleLoading}
+                            onClick={async () => {
+                              if (!capsuleTitle.trim() || !capsuleContent.trim()) return;
+                              setCapsuleLoading(true);
+                              try {
+                                await createIdeaCapsule({
+                                  title: capsuleTitle.trim(),
+                                  content: capsuleContent.trim(),
+                                  status: capsuleStatus,
+                                  priority: capsulePriority,
+                                  linked_papers: selected ? [selected.id] : [],
+                                  tags: capsuleTags
+                                    .split(",")
+                                    .map((item) => item.trim())
+                                    .filter(Boolean)
+                                });
+                                setCapsuleTitle("");
+                                setCapsuleContent("");
+                                setCapsuleTags("");
+                                await refreshCapsules();
+                                message.success(t("workspace.capsule_saved"));
+                              } finally {
+                                setCapsuleLoading(false);
+                              }
+                            }}
+                          >
+                            {t("workspace.capsule_add")}
+                          </Button>
+                        </Space>
+                        <List
+                          size="small"
+                          dataSource={capsules}
+                          locale={{ emptyText: t("workspace.capsule_empty") }}
+                          renderItem={(item) => (
+                            <List.Item
+                              actions={[
+                                <Button
+                                  key="promote"
+                                  size="small"
+                                  onClick={async () => {
+                                    const next =
+                                      item.status === "seed"
+                                        ? "incubating"
+                                        : item.status === "incubating"
+                                          ? "validated"
+                                          : item.status === "validated"
+                                            ? "archived"
+                                            : "archived";
+                                    await updateIdeaCapsule(item.id, { status: next });
+                                    await refreshCapsules();
+                                  }}
+                                >
+                                  {t("workspace.capsule_promote")}
+                                </Button>,
+                                <Button
+                                  key="delete"
+                                  danger
+                                  type="link"
+                                  onClick={async () => {
+                                    await deleteIdeaCapsule(item.id);
+                                    await refreshCapsules();
+                                  }}
+                                >
+                                  {t("manage.delete")}
+                                </Button>
+                              ]}
+                            >
+                              <Space direction="vertical" size={0}>
+                                <Text>{item.title}</Text>
+                                <Text type="secondary">
+                                  {item.status} · p{item.priority} · {(item.linked_papers || []).join(",")}
+                                </Text>
+                              </Space>
+                            </List.Item>
+                          )}
+                        />
+                      </Space>
+                    )
+                  },
+                  {
+                    key: "jobs",
+                    label: t("workspace.jobs"),
+                    children: (
+                      <Space direction="vertical" size="small" style={{ width: "100%" }}>
+                        <Space size="small" wrap>
+                          <Button onClick={refreshJobBoard} loading={jobLoading}>
+                            {t("btn.refresh")}
+                          </Button>
+                          <Button
+                            onClick={async () => {
+                              const res = await runQueuedJobs(5);
+                              message.success(`run ${res.executed}`);
+                              await refreshJobBoard();
+                            }}
+                          >
+                            {t("workspace.jobs_run")}
+                          </Button>
+                          <Tag color={syncStatus.alerts_open ? "red" : "green"}>
+                            alerts: {syncStatus.alerts_open ?? 0}
+                          </Tag>
+                        </Space>
+                        <List
+                          size="small"
+                          header={t("workspace.jobs_history")}
+                          dataSource={jobRuns.slice(0, 20)}
+                          renderItem={(item) => (
+                            <List.Item
+                              actions={[
+                                item.status === "failed" ? (
+                                  <Button
+                                    key="retry"
+                                    size="small"
+                                    onClick={async () => {
+                                      await retryJob(item.id);
+                                      await refreshJobBoard();
+                                    }}
+                                  >
+                                    {t("workspace.jobs_retry")}
+                                  </Button>
+                                ) : null
+                              ]}
+                            >
+                              <Space direction="vertical" size={0}>
+                                <Text>{item.job_type}</Text>
+                                <Text type="secondary">
+                                  #{item.id} · {item.status} · {item.error || "-"}
+                                </Text>
+                              </Space>
+                            </List.Item>
+                          )}
+                        />
+                        <List
+                          size="small"
+                          header={t("workspace.jobs_alerts")}
+                          dataSource={jobAlerts.slice(0, 20)}
+                          locale={{ emptyText: "-" }}
+                          renderItem={(item) => (
+                            <List.Item
+                              actions={[
+                                <Button
+                                  key="resolve"
+                                  size="small"
+                                  onClick={async () => {
+                                    await resolveJobAlert(item.id);
+                                    await refreshJobBoard();
+                                  }}
+                                >
+                                  {t("workspace.jobs_resolve")}
+                                </Button>
+                              ]}
+                            >
+                              <Text type="secondary">#{item.source_job_id} {item.message}</Text>
+                            </List.Item>
+                          )}
+                        />
                       </Space>
                     )
                   }
@@ -2666,6 +3251,23 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
             }}
           >
             {t("compare.set_target")}
+          </Button>
+          <Button
+            type="text"
+            block
+            onClick={async () => {
+              if (!pathSourceId) {
+                setPathSourceId(menu.node!.id);
+              } else {
+                setPathTargetId(menu.node!.id);
+                window.setTimeout(() => {
+                  highlightShortestPath();
+                }, 0);
+              }
+              setMenu((prev) => ({ ...prev, visible: false }));
+            }}
+          >
+            {t("graph.shortest_path")}
           </Button>
         </div>
       )}

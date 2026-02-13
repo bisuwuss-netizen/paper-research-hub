@@ -292,7 +292,10 @@ body {
 
 .graph-shell {
   display: grid;
-  grid-template-columns: clamp(220px, 18vw, 280px) minmax(0, 1fr) clamp(300px, 25vw, 390px);
+  grid-template-columns: clamp(220px, 18vw, 280px) minmax(0, 1fr) clamp(240px, 20vw, 300px);
+  grid-template-areas:
+    "sidebar main inspector"
+    "sidebar workbench workbench";
   gap: 18px;
   min-height: 560px;
   align-items: start;
@@ -302,13 +305,19 @@ body {
 }
 
 .graph-shell.is-standalone {
-  grid-template-columns: clamp(220px, 18vw, 280px) minmax(0, 1fr) clamp(300px, 25vw, 400px);
+  grid-template-columns: clamp(220px, 18vw, 280px) minmax(0, 1fr) clamp(240px, 20vw, 320px);
+  grid-template-areas:
+    "sidebar main inspector"
+    "sidebar workbench workbench";
   min-height: calc(100vh - 220px);
 }
 
 .graph-shell.is-sidebar-collapsed,
 .graph-shell.is-standalone.is-sidebar-collapsed {
-  grid-template-columns: minmax(0, 1fr) clamp(300px, 25vw, 400px);
+  grid-template-columns: minmax(0, 1fr) clamp(240px, 21vw, 320px);
+  grid-template-areas:
+    "main inspector"
+    "workbench workbench";
 }
 
 .graph-page {
@@ -316,16 +325,30 @@ body {
 }
 
 .graph-sidebar,
-.graph-detail {
+.graph-inspector,
+.graph-workbench {
   display: flex;
   flex-direction: column;
   gap: 16px;
   min-width: 0;
 }
 
+.graph-sidebar {
+  grid-area: sidebar;
+}
+
 .graph-main {
+  grid-area: main;
   position: relative;
   min-width: 0;
+}
+
+.graph-inspector {
+  grid-area: inspector;
+}
+
+.graph-workbench {
+  grid-area: workbench;
 }
 
 .graph-sidebar-card {
@@ -375,15 +398,21 @@ body {
   background: rgba(255, 255, 255, 0.8);
 }
 
-.graph-detail .graph-card {
+.graph-inspector .graph-card {
   position: sticky;
   top: 10px;
-  max-height: calc(100vh - 180px);
+  max-height: calc(100vh - 220px);
   overflow: hidden;
 }
 
-.graph-detail .graph-card .ant-card-body {
-  max-height: calc(100vh - 240px);
+.graph-inspector .graph-card .ant-card-body {
+  max-height: calc(100vh - 280px);
+  overflow: auto;
+  padding-right: 10px;
+}
+
+.graph-workbench .graph-card .ant-card-body {
+  max-height: clamp(320px, 40vh, 460px);
   overflow: auto;
   padding-right: 10px;
 }
@@ -487,24 +516,29 @@ body {
   .graph-shell,
   .graph-shell.is-standalone {
     grid-template-columns: clamp(220px, 22vw, 260px) minmax(0, 1fr);
+    grid-template-areas:
+      "sidebar main"
+      "inspector main"
+      "workbench workbench";
   }
 
   .graph-shell.is-sidebar-collapsed,
   .graph-shell.is-standalone.is-sidebar-collapsed {
     grid-template-columns: 1fr;
+    grid-template-areas:
+      "main"
+      "inspector"
+      "workbench";
   }
 
-  .graph-detail {
-    grid-column: 1 / -1;
-  }
-
-  .graph-detail .graph-card {
+  .graph-inspector .graph-card {
     position: relative;
     top: auto;
     max-height: none;
   }
 
-  .graph-detail .graph-card .ant-card-body {
+  .graph-inspector .graph-card .ant-card-body,
+  .graph-workbench .graph-card .ant-card-body {
     max-height: none;
     overflow: visible;
   }
@@ -518,10 +552,18 @@ body {
 @media (max-width: 1024px) {
   .graph-shell {
     grid-template-columns: 1fr;
+    grid-template-areas:
+      "main"
+      "inspector"
+      "workbench";
   }
 
   .graph-shell.is-standalone {
     grid-template-columns: 1fr;
+    grid-template-areas:
+      "main"
+      "inspector"
+      "workbench";
   }
 
   .graph-sidebar-card {

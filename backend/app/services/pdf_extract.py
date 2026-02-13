@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 import fitz  # PyMuPDF
 
@@ -15,6 +15,11 @@ try:
     import pdfplumber  # type: ignore
 except Exception:
     pdfplumber = None
+
+try:
+    import gmft  # type: ignore
+except Exception:
+    gmft = None
 
 
 @dataclass
@@ -396,3 +401,291 @@ def extract_ee_metrics(text: str, limit: int = 40) -> List[Dict[str, Any]]:
             if len(out) >= limit:
                 break
     return out
+
+
+def _normalize_cell(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _to_metric_from_cell(value: Any) -> Optional[float]:
+    text = _normalize_cell(value)
+    if not text:
+        return None
+    matched = re.search(r"(\d+(?:\.\d+)?)", text)
+    if not matched:
+        return None
+    return _to_metric(matched.group(1))
+
+
+def _is_dataset_cell(text: str) -> bool:
+    low = text.lower()
+    return any(
+        key in low
+        for key in [
+            "ace2005",
+            "ace 2005",
+            "ace05",
+            "maven",
+            "rams",
+            "wikievents",
+            "richere",
+            "ere",
+            "casie",
+            "fewevent",
+        ]
+    )
+
+
+def _guess_metric_columns(header: List[str]) -> Dict[str, int]:
+    columns: Dict[str, int] = {}
+    for idx, raw in enumerate(header):
+        token = raw.lower()
+        if "dataset" in token or "corpus" in token or token in {"data", "bench"}:
+            columns.setdefault("dataset_name", idx)
+        if token in {"p", "prec", "precision"} or "precision" in token:
+            columns.setdefault("precision", idx)
+        if token in {"r", "recall"} or "recall" in token:
+            columns.setdefault("recall", idx)
+        if token in {"f1", "f1-score", "f"} or "f1" in token:
+            columns.setdefault("f1", idx)
+        if "trigger" in token and "f1" in token:
+            columns.setdefault("trigger_f1", idx)
+        if "argument" in token and "f1" in token:
+            columns.setdefault("argument_f1", idx)
+    return columns
+
+
+def _iter_pdf_tables(pdf_path: str, max_pages: Optional[int] = None) -> List[Dict[str, Any]]:
+    tables: List[Dict[str, Any]] = []
+    if pdfplumber is not None:
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                page_count = len(pdf.pages) if max_pages is None else min(max_pages, len(pdf.pages))
+                for page_index in range(page_count):
+                    page = pdf.pages[page_index]
+                    raw_tables = page.extract_tables() or []
+                    for table_index, table in enumerate(raw_tables):
+                        if not table:
+                            continue
+                        rows = [
+                            [_normalize_cell(cell) for cell in row]
+                            for row in table
+                            if row and any(_normalize_cell(cell) for cell in row)
+                        ]
+                        if not rows:
+                            continue
+                        tables.append(
+                            {
+                                "parser": "pdfplumber",
+                                "table_id": f"p{page_index+1}_t{table_index+1}",
+                                "page": page_index + 1,
+                                "rows": rows,
+                            }
+                        )
+        except Exception:
+            pass
+
+    # Optional gmft enhancement, used when available.
+    if gmft is not None:
+        try:
+            if hasattr(gmft, "extract_tables"):
+                gmft_tables = gmft.extract_tables(pdf_path)  # type: ignore[attr-defined]
+            elif hasattr(gmft, "parse"):
+                gmft_tables = gmft.parse(pdf_path)  # type: ignore[attr-defined]
+            else:
+                gmft_tables = []
+            for idx, table in enumerate(gmft_tables or []):
+                rows = getattr(table, "rows", None) or table.get("rows") if isinstance(table, dict) else None
+                if not rows:
+                    continue
+                cleaned = [
+                    [_normalize_cell(cell) for cell in row]
+                    for row in rows
+                    if row and any(_normalize_cell(cell) for cell in row)
+                ]
+                if not cleaned:
+                    continue
+                page = getattr(table, "page", None) or (table.get("page") if isinstance(table, dict) else None)
+                tables.append(
+                    {
+                        "parser": "gmft",
+                        "table_id": f"gmft_{idx+1}",
+                        "page": int(page) if page else None,
+                        "rows": cleaned,
+                    }
+                )
+        except Exception:
+            # keep pdfplumber outputs if gmft parsing fails
+            pass
+    return tables
+
+
+def extract_structured_table_metrics(
+    pdf_path: str,
+    max_pages: Optional[int] = None,
+    limit: int = 80,
+) -> Dict[str, Any]:
+    tables = _iter_pdf_tables(pdf_path, max_pages=max_pages)
+    metrics: List[Dict[str, Any]] = []
+    cells: List[Dict[str, Any]] = []
+    seen = set()
+
+    for table in tables:
+        rows = table.get("rows") or []
+        if len(rows) < 2:
+            continue
+        header = [_normalize_cell(cell) for cell in rows[0]]
+        metric_cols = _guess_metric_columns(header)
+        if "dataset_name" not in metric_cols:
+            # fallback: detect dataset directly in row body
+            metric_cols["dataset_name"] = 0
+
+        for row_idx, row in enumerate(rows[1:], start=1):
+            if not row:
+                continue
+            dataset_idx = metric_cols.get("dataset_name", 0)
+            dataset_raw = _normalize_cell(row[dataset_idx] if dataset_idx < len(row) else "")
+            if not _is_dataset_cell(dataset_raw):
+                # locate dataset in any cell as fallback
+                dataset_raw = ""
+                for cell in row:
+                    candidate = _normalize_cell(cell)
+                    if _is_dataset_cell(candidate):
+                        dataset_raw = candidate
+                        break
+            if not dataset_raw:
+                continue
+
+            metric_item: Dict[str, Any] = {
+                "dataset_name": dataset_raw.replace(" ", ""),
+                "precision": None,
+                "recall": None,
+                "f1": None,
+                "trigger_f1": None,
+                "argument_f1": None,
+                "source": f"{table.get('table_id')} row {row_idx}",
+                "confidence": 0.86 if table.get("parser") == "gmft" else 0.78,
+                "table_id": table.get("table_id"),
+                "row_index": row_idx,
+                "col_index": None,
+                "cell_text": None,
+                "provenance": {
+                    "parser": table.get("parser"),
+                    "page": table.get("page"),
+                    "table_id": table.get("table_id"),
+                    "header": header,
+                    "cells": [],
+                },
+            }
+
+            for key in ["precision", "recall", "f1", "trigger_f1", "argument_f1"]:
+                col_idx = metric_cols.get(key)
+                if col_idx is None or col_idx >= len(row):
+                    continue
+                cell_val = row[col_idx]
+                parsed = _to_metric_from_cell(cell_val)
+                if parsed is None:
+                    continue
+                metric_item[key] = parsed
+                metric_item["col_index"] = col_idx
+                metric_item["cell_text"] = _normalize_cell(cell_val)
+                metric_item["provenance"]["cells"].append(
+                    {"metric": key, "row": row_idx, "col": col_idx, "text": _normalize_cell(cell_val)}
+                )
+                cells.append(
+                    {
+                        "metric_key": key,
+                        "metric_value": parsed,
+                        "dataset_name": metric_item["dataset_name"],
+                        "table_id": table.get("table_id"),
+                        "row_index": row_idx,
+                        "col_index": col_idx,
+                        "cell_text": _normalize_cell(cell_val),
+                        "parser": table.get("parser"),
+                        "confidence": metric_item["confidence"],
+                    }
+                )
+
+            if all(metric_item.get(k) is None for k in ["precision", "recall", "f1", "trigger_f1", "argument_f1"]):
+                continue
+
+            signature = (
+                metric_item["dataset_name"],
+                metric_item.get("precision"),
+                metric_item.get("recall"),
+                metric_item.get("f1"),
+                metric_item.get("trigger_f1"),
+                metric_item.get("argument_f1"),
+            )
+            if signature in seen:
+                continue
+            seen.add(signature)
+            metrics.append(metric_item)
+            if len(metrics) >= limit:
+                break
+        if len(metrics) >= limit:
+            break
+
+    return {"metrics": metrics, "cells": cells, "tables": len(tables)}
+
+
+def extract_citation_context_map(
+    full_text: str,
+    references: List[Dict[str, Any]],
+    max_context_per_ref: int = 1,
+) -> Dict[str, str]:
+    text = full_text or ""
+    if not text or not references:
+        return {}
+    body = text
+    marker = re.search(r"\n\s*(references|bibliography|参考文献)\b", text, flags=re.IGNORECASE)
+    if marker:
+        body = text[: marker.start()]
+    body_low = body.lower()
+
+    def sentence_window(idx: int) -> str:
+        left = max(body.rfind(".", 0, idx), body.rfind("。", 0, idx), body.rfind("!", 0, idx), body.rfind("?", 0, idx))
+        right_candidates = [body.find(".", idx), body.find("。", idx), body.find("!", idx), body.find("?", idx)]
+        right_candidates = [x for x in right_candidates if x >= 0]
+        right = min(right_candidates) if right_candidates else min(len(body), idx + 260)
+        start = max(0, left + 1)
+        end = min(len(body), right + 1)
+        return _normalize_cell(body[start:end])[:360]
+
+    mapping: Dict[str, str] = {}
+    for ref in references:
+        title = _normalize_cell(ref.get("title"))
+        doi = _normalize_cell(ref.get("doi"))
+        targets: List[Tuple[str, str]] = []
+        if title:
+            targets.append(("title", title))
+        if doi:
+            targets.append(("doi", doi))
+        if not targets:
+            continue
+        contexts: List[str] = []
+        for mode, token in targets:
+            needle = token.lower()
+            if mode == "title":
+                title_tokens = [x for x in re.findall(r"[a-z0-9]{4,}", needle) if x not in {"using", "model", "method"}]
+                if not title_tokens:
+                    continue
+                anchors = title_tokens[:3]
+                first_hit = -1
+                for anchor in anchors:
+                    first_hit = body_low.find(anchor)
+                    if first_hit >= 0:
+                        break
+                if first_hit < 0:
+                    continue
+                contexts.append(sentence_window(first_hit))
+            else:
+                hit = body_low.find(needle.lower())
+                if hit >= 0:
+                    contexts.append(sentence_window(hit))
+            if len(contexts) >= max_context_per_ref:
+                break
+        if contexts:
+            key = (title or doi).lower()
+            mapping[key] = contexts[0]
+    return mapping

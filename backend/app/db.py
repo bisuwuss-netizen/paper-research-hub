@@ -68,6 +68,8 @@ CITATIONS_COLUMNS = {
     "evidence": "TEXT",
     "intent": "TEXT",
     "intent_confidence": "REAL",
+    "context_snippet": "TEXT",
+    "intent_source": "TEXT",
 }
 
 
@@ -83,6 +85,15 @@ EXPERIMENTS_COLUMNS = {
     "metric_name": "TEXT",
     "metric_value": "REAL",
     "is_sota": "INTEGER DEFAULT 0",
+}
+
+
+EE_METRICS_COLUMNS = {
+    "table_id": "TEXT",
+    "row_index": "INTEGER",
+    "col_index": "INTEGER",
+    "cell_text": "TEXT",
+    "provenance_json": "TEXT",
 }
 
 
@@ -280,6 +291,130 @@ def ensure_db() -> None:
             );
             """
         )
+        _ensure_columns(conn, "ee_metrics", EE_METRICS_COLUMNS)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ee_metric_cells (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                paper_id INTEGER,
+                metric_key TEXT,
+                metric_value REAL,
+                dataset_name TEXT,
+                table_id TEXT,
+                row_index INTEGER,
+                col_index INTEGER,
+                cell_text TEXT,
+                parser TEXT,
+                confidence REAL,
+                created_at INTEGER,
+                FOREIGN KEY(paper_id) REFERENCES papers(id)
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schema_concepts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                canonical_name TEXT UNIQUE,
+                concept_type TEXT DEFAULT 'event',
+                aliases_json TEXT,
+                created_at INTEGER,
+                updated_at INTEGER
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS paper_schema_concepts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                paper_id INTEGER,
+                schema_name TEXT,
+                canonical_concept_id INTEGER,
+                concept_type TEXT DEFAULT 'event',
+                confidence REAL,
+                created_at INTEGER,
+                updated_at INTEGER,
+                FOREIGN KEY(paper_id) REFERENCES papers(id),
+                FOREIGN KEY(canonical_concept_id) REFERENCES schema_concepts(id)
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS idea_capsules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT,
+                content TEXT,
+                status TEXT DEFAULT 'seed',
+                priority INTEGER DEFAULT 2,
+                linked_papers_json TEXT,
+                tags_json TEXT,
+                source_note_paper_id INTEGER,
+                created_at INTEGER,
+                updated_at INTEGER,
+                FOREIGN KEY(source_note_paper_id) REFERENCES papers(id)
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT,
+                language TEXT DEFAULT 'zh',
+                created_at INTEGER,
+                updated_at INTEGER
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER,
+                role TEXT,
+                content TEXT,
+                paper_ids_json TEXT,
+                trace_score REAL,
+                sources_json TEXT,
+                created_at INTEGER,
+                FOREIGN KEY(session_id) REFERENCES chat_sessions(id)
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS job_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_type TEXT,
+                status TEXT,
+                payload_json TEXT,
+                result_json TEXT,
+                attempts INTEGER DEFAULT 0,
+                error TEXT,
+                started_at INTEGER,
+                finished_at INTEGER,
+                next_retry_at INTEGER,
+                created_at INTEGER,
+                updated_at INTEGER
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS system_alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                level TEXT,
+                source_job_id INTEGER,
+                message TEXT,
+                payload_json TEXT,
+                resolved INTEGER DEFAULT 0,
+                created_at INTEGER,
+                resolved_at INTEGER,
+                FOREIGN KEY(source_job_id) REFERENCES job_runs(id)
+            );
+            """
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS zotero_mapping_templates (
@@ -342,6 +477,14 @@ def ensure_db() -> None:
             "ON citations(confidence)"
         )
         conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_citations_intent "
+            "ON citations(intent, intent_confidence)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_citations_context "
+            "ON citations(source_paper_id, target_paper_id, context_snippet)"
+        )
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_sync_queue_next "
             "ON sync_queue(next_run_at)"
         )
@@ -379,6 +522,33 @@ def ensure_db() -> None:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ee_metrics_paper ON ee_metrics(paper_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ee_metric_cells_paper ON ee_metric_cells(paper_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ee_metric_cells_dataset ON ee_metric_cells(dataset_name)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_schema_concepts_name ON schema_concepts(canonical_name)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_paper_schema_concepts_paper ON paper_schema_concepts(paper_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_paper_schema_concepts_concept ON paper_schema_concepts(canonical_concept_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_capsules_status ON idea_capsules(status, priority)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id, created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_job_runs_status ON job_runs(status, created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_alerts_resolved ON system_alerts(resolved, created_at)"
         )
         conn.execute("UPDATE papers SET read_status = 0 WHERE read_status IS NULL")
         conn.execute(

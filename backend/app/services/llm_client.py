@@ -557,6 +557,7 @@ def classify_citation_intent(
     source_title: Optional[str],
     source_abstract: Optional[str],
     target_title: Optional[str],
+    citation_context: Optional[str] = None,
 ) -> Dict[str, Any]:
     provider = os.getenv("LLM_PROVIDER", "").strip().lower()
     api_key = os.getenv("LLM_API_KEY", "").strip()
@@ -566,11 +567,13 @@ def classify_citation_intent(
         return {"intent": "mention", "confidence": 0.35}
 
     if not provider or not api_key or not endpoint or not model:
-        text = (source_abstract or "").lower()
+        text = (citation_context or source_abstract or "").lower()
         if "baseline" in text or "build on" in text or "following" in text:
             return {"intent": "build_on", "confidence": 0.55}
         if "however" in text or "limitation" in text or "challenge" in text:
             return {"intent": "contrast", "confidence": 0.5}
+        if "we use" in text or "adopt" in text or "follow" in text:
+            return {"intent": "use_as_baseline", "confidence": 0.5}
         return {"intent": "mention", "confidence": 0.4}
 
     headers = {"Authorization": f"Bearer {api_key}"}
@@ -581,6 +584,7 @@ def classify_citation_intent(
         "confidence in [0,1].\n\n"
         f"Source title: {source_title}\n"
         f"Source abstract: {source_abstract or ''}\n"
+        f"Citation context (from body): {citation_context or ''}\n"
         f"Cited title: {target_title}\n"
     )
     payload = {

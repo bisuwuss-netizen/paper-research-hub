@@ -53,6 +53,8 @@ from .services.pdf_extract import (
     extract_markdown,
     extract_tables_text,
     extract_ee_metrics,
+    extract_structured_table_metrics,
+    extract_citation_context_map,
 )
 from .services.semantic_scholar import (
     extract_paper_from_edge,
@@ -125,9 +127,21 @@ def _cleanup_citations(conn) -> dict:
     conn.execute("DELETE FROM citations WHERE source_paper_id = target_paper_id")
     conn.execute("DELETE FROM paper_chunks WHERE paper_id NOT IN (SELECT id FROM papers)")
     conn.execute("DELETE FROM ee_metrics WHERE paper_id NOT IN (SELECT id FROM papers)")
+    conn.execute("DELETE FROM ee_metric_cells WHERE paper_id NOT IN (SELECT id FROM papers)")
     conn.execute("DELETE FROM paper_schemas WHERE paper_id NOT IN (SELECT id FROM papers)")
+    conn.execute("DELETE FROM paper_schema_concepts WHERE paper_id NOT IN (SELECT id FROM papers)")
+    conn.execute(
+        "DELETE FROM paper_schema_concepts WHERE canonical_concept_id NOT IN (SELECT id FROM schema_concepts)"
+    )
+    conn.execute(
+        "DELETE FROM schema_concepts WHERE id NOT IN (SELECT canonical_concept_id FROM paper_schema_concepts)"
+    )
     conn.execute("DELETE FROM note_links WHERE source_paper_id NOT IN (SELECT id FROM papers)")
     conn.execute("DELETE FROM note_links WHERE target_paper_id NOT IN (SELECT id FROM papers)")
+    conn.execute(
+        "DELETE FROM idea_capsules WHERE source_note_paper_id IS NOT NULL "
+        "AND source_note_paper_id NOT IN (SELECT id FROM papers)"
+    )
     after = conn.execute("SELECT COUNT(*) AS c FROM citations").fetchone()["c"]
     return {"before": before, "after": after, "removed": max(0, before - after)}
 
@@ -187,6 +201,20 @@ def start_sync_worker():
     with get_conn() as conn:
         _ensure_periodic_reports(conn)
         _sync_search_fts(conn)
+        if os.getenv("SCHEMA_ALIGN_ON_START", "true").lower() == "true":
+            rows = conn.execute(
+                "SELECT paper_id, event_types_json, role_types_json, confidence FROM paper_schemas"
+            ).fetchall()
+            for row in rows:
+                _align_schema_concepts_for_paper(
+                    conn,
+                    row["paper_id"],
+                    {
+                        "event_types": _json_loads(row["event_types_json"], []),
+                        "role_types": _json_loads(row["role_types_json"], []),
+                        "confidence": row["confidence"] or 0.6,
+                    },
+                )
     if _sync_worker_started:
         return
     if os.getenv("SYNC_ENABLED", "true").lower() != "true":
@@ -427,7 +455,10 @@ def _upsert_paper_schema(
             now_ts,
         ),
     )
-    return _fetch_paper_schema(conn, paper_id)
+    aligned = _align_schema_concepts_for_paper(conn, paper_id, schema)
+    result = _fetch_paper_schema(conn, paper_id)
+    result["aligned_concepts"] = aligned
+    return result
 
 
 def _extract_and_store_schema(
@@ -439,6 +470,7 @@ def _extract_and_store_schema(
 ) -> Dict[str, Any]:
     existing = _fetch_paper_schema(conn, paper_id)
     if not force and existing.get("event_types"):
+        existing["aligned_concepts"] = _align_schema_concepts_for_paper(conn, paper_id, existing)
         return existing
     schema = extract_event_schema(full_text, max_types=24)
     return _upsert_paper_schema(conn, paper_id, schema=schema, source=source)
@@ -583,8 +615,10 @@ def _upsert_ee_metrics(
         conn.execute(
             """
             INSERT INTO ee_metrics (
-                paper_id, dataset_name, precision, recall, f1, trigger_f1, argument_f1, source, confidence, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                paper_id, dataset_name, precision, recall, f1, trigger_f1, argument_f1,
+                source, confidence, created_at,
+                table_id, row_index, col_index, cell_text, provenance_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 paper_id,
@@ -597,6 +631,11 @@ def _upsert_ee_metrics(
                 source,
                 item.get("confidence"),
                 now_ts,
+                item.get("table_id"),
+                item.get("row_index"),
+                item.get("col_index"),
+                item.get("cell_text"),
+                _json_dumps(item.get("provenance") or {}),
             ),
         )
         inserted += 1
@@ -796,6 +835,13 @@ def _build_metric_leaderboard(
             m.paper_id,
             m.dataset_name,
             m.{metric_column} AS metric_value,
+            m.table_id,
+            m.row_index,
+            m.col_index,
+            m.cell_text,
+            m.provenance_json,
+            m.source,
+            m.confidence,
             p.title,
             p.year,
             p.sub_field,
@@ -808,6 +854,8 @@ def _build_metric_leaderboard(
     """
     params.append(max(1, min(limit, 300)))
     top_rows = [dict(r) for r in conn.execute(query, params).fetchall()]
+    for row in top_rows:
+        row["provenance"] = _json_loads(row.get("provenance_json"), {})
 
     trend_query = f"""
         SELECT
@@ -829,6 +877,427 @@ def _build_metric_leaderboard(
         "top_items": top_rows,
         "trend": trend_rows,
     }
+
+
+def _canonicalize_schema_token(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return None
+    normalized = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", name.lower()).strip()
+    if not normalized:
+        return None
+    synonyms = {
+        "attacking": "attack",
+        "attacked": "attack",
+        "conflicts": "conflict",
+        "confliction": "conflict",
+        "movement event": "movement",
+        "transaction event": "transaction",
+        "contact event": "contact",
+        "life event": "life",
+        "personnel event": "personnel",
+        "justice event": "justice",
+    }
+    normalized = synonyms.get(normalized, normalized)
+    parts = normalized.split()
+    if len(parts) > 3:
+        normalized = " ".join(parts[:3])
+    return normalized[:80]
+
+
+def _upsert_schema_concept(
+    conn,
+    canonical_name: str,
+    concept_type: str,
+    aliases: List[str],
+) -> int:
+    now_ts = _now_ts()
+    row = conn.execute(
+        "SELECT * FROM schema_concepts WHERE canonical_name = ? AND concept_type = ?",
+        (canonical_name, concept_type),
+    ).fetchone()
+    merged_aliases = aliases
+    if row:
+        existing_aliases = _json_loads(row["aliases_json"], [])
+        seen = {str(a).strip().lower() for a in existing_aliases if str(a).strip()}
+        merged_aliases = list(existing_aliases)
+        for alias in aliases:
+            key = alias.strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged_aliases.append(alias[:80])
+        conn.execute(
+            """
+            UPDATE schema_concepts
+            SET aliases_json = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (_json_dumps(merged_aliases[:40]), now_ts, row["id"]),
+        )
+        return int(row["id"])
+    conn.execute(
+        """
+        INSERT INTO schema_concepts (
+            canonical_name, concept_type, aliases_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        (canonical_name, concept_type, _json_dumps(aliases[:40]), now_ts, now_ts),
+    )
+    created = conn.execute("SELECT id FROM schema_concepts ORDER BY id DESC LIMIT 1").fetchone()
+    return int(created["id"])
+
+
+def _align_schema_concepts_for_paper(conn, paper_id: int, schema: Dict[str, Any]) -> int:
+    event_types = schema.get("event_types") or []
+    role_types = schema.get("role_types") or []
+    now_ts = _now_ts()
+    conn.execute("DELETE FROM paper_schema_concepts WHERE paper_id = ?", (paper_id,))
+    linked = 0
+    for event in event_types:
+        if not isinstance(event, dict):
+            continue
+        name = _canonicalize_schema_token(event.get("name"))
+        if not name:
+            continue
+        aliases = [event.get("name")] + (event.get("aliases") or [])
+        alias_values = [str(x).strip()[:80] for x in aliases if str(x).strip()]
+        concept_id = _upsert_schema_concept(conn, name, "event", alias_values)
+        conn.execute(
+            """
+            INSERT INTO paper_schema_concepts (
+                paper_id, schema_name, canonical_concept_id, concept_type, confidence, created_at, updated_at
+            ) VALUES (?, ?, ?, 'event', ?, ?, ?)
+            """,
+            (
+                paper_id,
+                event.get("name"),
+                concept_id,
+                float(schema.get("confidence") or 0.6),
+                now_ts,
+                now_ts,
+            ),
+        )
+        linked += 1
+    for role in role_types:
+        role_name = _canonicalize_schema_token(str(role))
+        if not role_name:
+            continue
+        concept_id = _upsert_schema_concept(conn, role_name, "role", [str(role)])
+        conn.execute(
+            """
+            INSERT INTO paper_schema_concepts (
+                paper_id, schema_name, canonical_concept_id, concept_type, confidence, created_at, updated_at
+            ) VALUES (?, ?, ?, 'role', ?, ?, ?)
+            """,
+            (paper_id, str(role), concept_id, float(schema.get("confidence") or 0.6), now_ts, now_ts),
+        )
+        linked += 1
+    return linked
+
+
+def _build_schema_ontology_graph(conn, min_support: int = 2) -> Dict[str, Any]:
+    rows = conn.execute(
+        """
+        SELECT
+            c.id,
+            c.canonical_name,
+            c.concept_type,
+            c.aliases_json,
+            COUNT(psc.paper_id) AS paper_count
+        FROM schema_concepts c
+        LEFT JOIN paper_schema_concepts psc ON psc.canonical_concept_id = c.id
+        GROUP BY c.id
+        HAVING paper_count >= ?
+        ORDER BY paper_count DESC, c.canonical_name ASC
+        """,
+        (max(1, min_support),),
+    ).fetchall()
+    nodes = []
+    concept_ids = []
+    for row in rows:
+        concept_ids.append(int(row["id"]))
+        nodes.append(
+            {
+                "id": int(row["id"]),
+                "name": row["canonical_name"],
+                "type": row["concept_type"],
+                "aliases": _json_loads(row["aliases_json"], []),
+                "paper_count": int(row["paper_count"] or 0),
+            }
+        )
+    if not concept_ids:
+        return {"nodes": [], "edges": []}
+    placeholders = ",".join(["?"] * len(concept_ids))
+    links = conn.execute(
+        f"""
+        SELECT
+            a.canonical_concept_id AS source_id,
+            b.canonical_concept_id AS target_id,
+            COUNT(*) AS co_count
+        FROM paper_schema_concepts a
+        JOIN paper_schema_concepts b
+            ON a.paper_id = b.paper_id
+           AND a.canonical_concept_id < b.canonical_concept_id
+        WHERE a.canonical_concept_id IN ({placeholders})
+          AND b.canonical_concept_id IN ({placeholders})
+        GROUP BY a.canonical_concept_id, b.canonical_concept_id
+        HAVING co_count >= ?
+        ORDER BY co_count DESC
+        """,
+        [*concept_ids, *concept_ids, 2],
+    ).fetchall()
+    edges = [
+        {
+            "source": int(row["source_id"]),
+            "target": int(row["target_id"]),
+            "co_count": int(row["co_count"] or 0),
+        }
+        for row in links
+    ]
+    return {"nodes": nodes, "edges": edges}
+
+
+def _upsert_metric_cells(conn, paper_id: int, cells: List[Dict[str, Any]], parser: str) -> int:
+    conn.execute("DELETE FROM ee_metric_cells WHERE paper_id = ? AND parser = ?", (paper_id, parser))
+    now_ts = _now_ts()
+    inserted = 0
+    for item in cells:
+        conn.execute(
+            """
+            INSERT INTO ee_metric_cells (
+                paper_id, metric_key, metric_value, dataset_name, table_id,
+                row_index, col_index, cell_text, parser, confidence, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                paper_id,
+                item.get("metric_key"),
+                item.get("metric_value"),
+                item.get("dataset_name"),
+                item.get("table_id"),
+                item.get("row_index"),
+                item.get("col_index"),
+                item.get("cell_text"),
+                item.get("parser") or parser,
+                item.get("confidence"),
+                now_ts,
+            ),
+        )
+        inserted += 1
+    return inserted
+
+
+def _create_job(conn, job_type: str, payload: Optional[Dict[str, Any]] = None) -> int:
+    now_ts = _now_ts()
+    conn.execute(
+        """
+        INSERT INTO job_runs (
+            job_type, status, payload_json, attempts, started_at, created_at, updated_at
+        ) VALUES (?, 'running', ?, 1, ?, ?, ?)
+        """,
+        (job_type, _json_dumps(payload or {}), now_ts, now_ts, now_ts),
+    )
+    row = conn.execute("SELECT id FROM job_runs ORDER BY id DESC LIMIT 1").fetchone()
+    return int(row["id"])
+
+
+def _finish_job(conn, job_id: int, result: Optional[Dict[str, Any]] = None) -> None:
+    now_ts = _now_ts()
+    conn.execute(
+        """
+        UPDATE job_runs
+        SET status = 'success', result_json = ?, finished_at = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (_json_dumps(result or {}), now_ts, now_ts, job_id),
+    )
+
+
+def _fail_job(conn, job_id: int, error: str, retry_in_seconds: int = 300) -> None:
+    now_ts = _now_ts()
+    next_retry = now_ts + max(60, retry_in_seconds)
+    conn.execute(
+        """
+        UPDATE job_runs
+        SET status = 'failed',
+            error = ?,
+            finished_at = ?,
+            next_retry_at = ?,
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (error[:800], now_ts, next_retry, now_ts, job_id),
+    )
+    conn.execute(
+        """
+        INSERT INTO system_alerts (level, source_job_id, message, payload_json, resolved, created_at)
+        VALUES ('error', ?, ?, ?, 0, ?)
+        """,
+        (job_id, f"{error[:160]}", _json_dumps({"job_id": job_id}), now_ts),
+    )
+
+
+def _job_payload(conn, row: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(row)
+    out["payload"] = _json_loads(out.get("payload_json"), {})
+    out["result"] = _json_loads(out.get("result_json"), {})
+    return out
+
+
+def _create_chat_session(conn, title: Optional[str], language: str) -> Dict[str, Any]:
+    now_ts = _now_ts()
+    conn.execute(
+        """
+        INSERT INTO chat_sessions (title, language, created_at, updated_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (title or "Paper QA Session", language or "zh", now_ts, now_ts),
+    )
+    row = conn.execute("SELECT * FROM chat_sessions ORDER BY id DESC LIMIT 1").fetchone()
+    return dict(row)
+
+
+def _append_chat_message(
+    conn,
+    session_id: int,
+    role: str,
+    content: str,
+    paper_ids: Optional[List[int]] = None,
+    trace_score: Optional[float] = None,
+    sources: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    now_ts = _now_ts()
+    conn.execute(
+        """
+        INSERT INTO chat_messages (
+            session_id, role, content, paper_ids_json, trace_score, sources_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            session_id,
+            role,
+            content[:12000],
+            _json_dumps(paper_ids or []),
+            trace_score,
+            _json_dumps(sources or []),
+            now_ts,
+        ),
+    )
+    conn.execute("UPDATE chat_sessions SET updated_at = ? WHERE id = ?", (now_ts, session_id))
+
+
+def _fetch_chat_memory(conn, session_id: int, max_turns: int = 6) -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT role, content
+        FROM chat_messages
+        WHERE session_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (session_id, max(2, max_turns * 2)),
+    ).fetchall()
+    # Reverse to chronological order
+    return [dict(r) for r in reversed(rows)]
+
+
+def _retrieve_rag_contexts(
+    conn,
+    query: str,
+    paper_ids: Optional[List[int]],
+    top_k: int = 8,
+) -> List[Dict[str, Any]]:
+    vector_hits = _retrieve_rag_chunks(
+        conn,
+        query=query,
+        paper_ids=paper_ids,
+        top_k=max(8, top_k * 2),
+    )
+    docs = _collect_search_documents(conn)
+    keyword_hits = hybrid_search(query, docs, top_k=max(8, top_k * 2))
+    paper_map = {
+        r["id"]: dict(r)
+        for r in conn.execute("SELECT id, title, abstract FROM papers").fetchall()
+    }
+    merged: Dict[Tuple[int, Optional[int]], Dict[str, Any]] = {}
+
+    for hit in vector_hits:
+        pid = int(hit.get("paper_id") or 0)
+        if paper_ids and pid not in paper_ids:
+            continue
+        chunk_idx = hit.get("chunk_index")
+        key = (pid, chunk_idx)
+        merged[key] = {
+            "paper_id": pid,
+            "chunk_index": chunk_idx,
+            "title": hit.get("title") or paper_map.get(pid, {}).get("title"),
+            "chunk_text": hit.get("chunk_text") or "",
+            "vector_score": float(hit.get("score") or 0.0),
+            "keyword_score": 0.0,
+            "route": "vector",
+        }
+
+    for item in keyword_hits:
+        pid = int(item.get("doc_id") or 0)
+        if paper_ids and pid not in paper_ids:
+            continue
+        row = paper_map.get(pid, {})
+        key = (pid, None)
+        existing = merged.get(key) or {
+            "paper_id": pid,
+            "chunk_index": None,
+            "title": row.get("title"),
+            "chunk_text": (row.get("abstract") or row.get("title") or "")[:1200],
+            "vector_score": 0.0,
+            "keyword_score": 0.0,
+            "route": "keyword",
+        }
+        existing["keyword_score"] = max(existing.get("keyword_score", 0.0), float(item.get("score") or 0.0))
+        existing["bm25_score"] = float(item.get("bm25_score") or 0.0)
+        existing["semantic_score"] = float(item.get("semantic_score") or 0.0)
+        if existing.get("route") != "vector":
+            existing["route"] = "keyword"
+        else:
+            existing["route"] = "hybrid"
+        merged[key] = existing
+
+    ranked: List[Dict[str, Any]] = []
+    for value in merged.values():
+        # lightweight reranker with lexical overlap and dense score mixture
+        text = (value.get("chunk_text") or "").lower()
+        q_tokens = [tok for tok in re.findall(r"[a-z0-9\u4e00-\u9fff]+", query.lower()) if len(tok) >= 2]
+        overlap = 0.0
+        if q_tokens:
+            overlap = sum(1 for tok in q_tokens if tok in text) / len(q_tokens)
+        value["rerank_score"] = round(
+            0.5 * float(value.get("vector_score") or 0.0)
+            + 0.35 * float(value.get("keyword_score") or 0.0)
+            + 0.15 * overlap,
+            6,
+        )
+        value["score"] = value["rerank_score"]
+        ranked.append(value)
+
+    ranked.sort(key=lambda x: x.get("rerank_score", 0.0), reverse=True)
+    return ranked[: max(2, min(top_k, 20))]
+
+
+def _traceability_score(sources: List[Dict[str, Any]], answer: str) -> float:
+    if not sources:
+        return 0.0
+    avg_score = 0.0
+    count = 0
+    for source in sources:
+        score = source.get("score")
+        try:
+            avg_score += float(score)
+            count += 1
+        except Exception:
+            continue
+    base = (avg_score / count) if count else 0.35
+    answer_len = len((answer or "").strip())
+    length_factor = 1.0 if answer_len >= 80 else max(0.4, answer_len / 80.0)
+    return round(max(0.0, min(1.0, base * length_factor)), 4)
 
 
 def _get_shortest_path(
@@ -1060,6 +1529,8 @@ class ChatQueryRequest(BaseModel):
     query: str
     top_k: int = 6
     language: str = "zh"
+    session_id: Optional[int] = None
+    use_memory: bool = True
 
 
 class CitationIntentRequest(BaseModel):
@@ -1069,6 +1540,30 @@ class CitationIntentRequest(BaseModel):
 
 class ComparePapersRequest(BaseModel):
     paper_ids: List[int]
+
+
+class IdeaCapsuleCreateRequest(BaseModel):
+    title: str
+    content: str
+    status: str = "seed"
+    priority: int = 2
+    linked_papers: List[int] = []
+    tags: List[str] = []
+    source_note_paper_id: Optional[int] = None
+
+
+class IdeaCapsuleUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    content: Optional[str] = None
+    status: Optional[str] = None
+    priority: Optional[int] = None
+    linked_papers: Optional[List[int]] = None
+    tags: Optional[List[str]] = None
+
+
+class ChatSessionCreateRequest(BaseModel):
+    title: Optional[str] = None
+    language: str = "zh"
 
 
 @app.get("/api/papers", response_model=List[Paper])
@@ -1087,7 +1582,7 @@ def search_papers(q: str, top_k: int = 20):
     with get_conn() as conn:
         docs = _collect_search_documents(conn)
         ranked = hybrid_search(query, docs, top_k=max(1, min(top_k, 100)))
-        chunk_hits = _retrieve_rag_chunks(conn, query, top_k=max(6, min(top_k * 2, 30)))
+        chunk_hits = _retrieve_rag_contexts(conn, query, paper_ids=None, top_k=max(6, min(top_k * 2, 30)))
         chunk_score_map: Dict[int, float] = {}
         best_chunk_map: Dict[int, Dict[str, Any]] = {}
         for hit in chunk_hits:
@@ -1296,6 +1791,330 @@ def search_schemas(keyword: str, limit: int = 50):
             if len(items) >= limit:
                 break
         return {"keyword": keyword, "count": len(items), "items": items}
+
+
+@app.post("/api/schemas/align")
+def align_schema_ontology(limit: int = 500):
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT paper_id, event_types_json, role_types_json, confidence
+            FROM paper_schemas
+            ORDER BY COALESCE(updated_at, 0) DESC
+            LIMIT ?
+            """,
+            (max(1, min(limit, 5000)),),
+        ).fetchall()
+        aligned = 0
+        for row in rows:
+            schema = {
+                "event_types": _json_loads(row["event_types_json"], []),
+                "role_types": _json_loads(row["role_types_json"], []),
+                "confidence": row["confidence"] or 0.6,
+            }
+            aligned += _align_schema_concepts_for_paper(conn, row["paper_id"], schema)
+        graph = _build_schema_ontology_graph(conn, min_support=1)
+        return {
+            "papers_processed": len(rows),
+            "aligned_links": aligned,
+            "concepts": len(graph["nodes"]),
+        }
+
+
+@app.get("/api/schemas/ontology")
+def schema_ontology_graph(min_support: int = 2):
+    with get_conn() as conn:
+        graph = _build_schema_ontology_graph(conn, min_support=max(1, min_support))
+        return {
+            "nodes": graph["nodes"],
+            "edges": graph["edges"],
+            "count": len(graph["nodes"]),
+        }
+
+
+@app.post("/api/chat/sessions")
+def create_chat_session(payload: ChatSessionCreateRequest):
+    with get_conn() as conn:
+        session = _create_chat_session(conn, payload.title, payload.language)
+        return session
+
+
+@app.get("/api/chat/sessions")
+def list_chat_sessions(limit: int = 20):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM chat_sessions ORDER BY COALESCE(updated_at, 0) DESC LIMIT ?",
+            (max(1, min(limit, 200)),),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+@app.get("/api/chat/sessions/{session_id}/messages")
+def list_chat_messages(session_id: int, limit: int = 100):
+    with get_conn() as conn:
+        exists = conn.execute("SELECT id FROM chat_sessions WHERE id = ?", (session_id,)).fetchone()
+        if not exists:
+            raise HTTPException(status_code=404, detail="Session not found")
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM chat_messages
+            WHERE session_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (session_id, max(1, min(limit, 500))),
+        ).fetchall()
+        items = []
+        for row in rows:
+            data = dict(row)
+            data["paper_ids"] = _json_loads(data.get("paper_ids_json"), [])
+            data["sources"] = _json_loads(data.get("sources_json"), [])
+            items.append(data)
+        return list(reversed(items))
+
+
+@app.get("/api/idea-capsules")
+def list_idea_capsules(status: Optional[str] = None, paper_id: Optional[int] = None, limit: int = 200):
+    with get_conn() as conn:
+        query = "SELECT * FROM idea_capsules WHERE 1=1"
+        params: List[Any] = []
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY priority DESC, COALESCE(updated_at, 0) DESC LIMIT ?"
+        params.append(max(1, min(limit, 1000)))
+        rows = conn.execute(query, params).fetchall()
+        out = []
+        for row in rows:
+            data = dict(row)
+            linked = _json_loads(data.get("linked_papers_json"), [])
+            if paper_id and paper_id not in linked:
+                continue
+            data["linked_papers"] = linked
+            data["tags"] = _json_loads(data.get("tags_json"), [])
+            out.append(data)
+        return {"items": out, "count": len(out)}
+
+
+@app.get("/api/idea-capsules/board")
+def idea_capsule_board():
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM idea_capsules ORDER BY COALESCE(updated_at, 0) DESC").fetchall()
+        board: Dict[str, List[Dict[str, Any]]] = {"seed": [], "incubating": [], "validated": [], "archived": []}
+        for row in rows:
+            data = dict(row)
+            status = data.get("status") or "seed"
+            if status not in board:
+                board.setdefault(status, [])
+            data["linked_papers"] = _json_loads(data.get("linked_papers_json"), [])
+            data["tags"] = _json_loads(data.get("tags_json"), [])
+            board[status].append(data)
+        summary = {key: len(value) for key, value in board.items()}
+        return {"board": board, "summary": summary}
+
+
+@app.post("/api/idea-capsules")
+def create_idea_capsule(payload: IdeaCapsuleCreateRequest):
+    allowed = {"seed", "incubating", "validated", "archived"}
+    status = payload.status if payload.status in allowed else "seed"
+    with get_conn() as conn:
+        now_ts = _now_ts()
+        conn.execute(
+            """
+            INSERT INTO idea_capsules (
+                title, content, status, priority, linked_papers_json, tags_json, source_note_paper_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload.title.strip(),
+                payload.content.strip(),
+                status,
+                max(1, min(payload.priority, 5)),
+                _json_dumps(payload.linked_papers),
+                _json_dumps(payload.tags),
+                payload.source_note_paper_id,
+                now_ts,
+                now_ts,
+            ),
+        )
+        row = conn.execute("SELECT * FROM idea_capsules ORDER BY id DESC LIMIT 1").fetchone()
+        data = dict(row)
+        data["linked_papers"] = _json_loads(data.get("linked_papers_json"), [])
+        data["tags"] = _json_loads(data.get("tags_json"), [])
+        return data
+
+
+@app.patch("/api/idea-capsules/{capsule_id}")
+def update_idea_capsule(capsule_id: int, payload: IdeaCapsuleUpdateRequest):
+    updates = payload.model_dump(exclude_unset=True)
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    allowed = {"seed", "incubating", "validated", "archived"}
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM idea_capsules WHERE id = ?", (capsule_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Idea capsule not found")
+        fields = []
+        values: List[Any] = []
+        if "status" in updates:
+            status = updates["status"]
+            updates["status"] = status if status in allowed else "seed"
+        if "priority" in updates:
+            updates["priority"] = max(1, min(int(updates["priority"]), 5))
+        if "linked_papers" in updates:
+            updates["linked_papers_json"] = _json_dumps(updates.pop("linked_papers"))
+        if "tags" in updates:
+            updates["tags_json"] = _json_dumps(updates.pop("tags"))
+        for key, value in updates.items():
+            fields.append(f"{key} = ?")
+            values.append(value)
+        fields.append("updated_at = ?")
+        values.append(_now_ts())
+        values.append(capsule_id)
+        conn.execute(f"UPDATE idea_capsules SET {', '.join(fields)} WHERE id = ?", values)
+        updated = conn.execute("SELECT * FROM idea_capsules WHERE id = ?", (capsule_id,)).fetchone()
+        data = dict(updated)
+        data["linked_papers"] = _json_loads(data.get("linked_papers_json"), [])
+        data["tags"] = _json_loads(data.get("tags_json"), [])
+        return data
+
+
+@app.delete("/api/idea-capsules/{capsule_id}")
+def delete_idea_capsule(capsule_id: int):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM idea_capsules WHERE id = ?", (capsule_id,))
+        return {"status": "deleted"}
+
+
+@app.get("/api/jobs/history")
+def list_job_history(status: Optional[str] = None, limit: int = 100):
+    with get_conn() as conn:
+        params: List[Any] = []
+        query = "SELECT * FROM job_runs"
+        if status:
+            query += " WHERE status = ?"
+            params.append(status)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(max(1, min(limit, 500)))
+        rows = conn.execute(query, params).fetchall()
+        return {"items": [_job_payload(conn, dict(r)) for r in rows], "count": len(rows)}
+
+
+@app.post("/api/jobs/{job_id}/retry")
+def retry_failed_job(job_id: int):
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM job_runs WHERE id = ?", (job_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found")
+        job = dict(row)
+        if job.get("status") != "failed":
+            raise HTTPException(status_code=400, detail="Only failed jobs can be retried")
+        payload = _json_loads(job.get("payload_json"), {})
+        conn.execute(
+            """
+            UPDATE job_runs
+            SET status = 'queued',
+                attempts = COALESCE(attempts, 1) + 1,
+                next_retry_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (_now_ts(), _now_ts(), job_id),
+        )
+        return {"job_id": job_id, "status": "queued", "payload": payload}
+
+
+@app.get("/api/jobs/alerts")
+def list_job_alerts(resolved: Optional[bool] = None, limit: int = 100):
+    with get_conn() as conn:
+        query = "SELECT * FROM system_alerts WHERE 1=1"
+        params: List[Any] = []
+        if resolved is not None:
+            query += " AND resolved = ?"
+            params.append(1 if resolved else 0)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(max(1, min(limit, 500)))
+        rows = conn.execute(query, params).fetchall()
+        items = []
+        for row in rows:
+            data = dict(row)
+            data["payload"] = _json_loads(data.get("payload_json"), {})
+            items.append(data)
+        return {"items": items, "count": len(items)}
+
+
+@app.post("/api/jobs/alerts/{alert_id}/resolve")
+def resolve_job_alert(alert_id: int):
+    with get_conn() as conn:
+        row = conn.execute("SELECT id FROM system_alerts WHERE id = ?", (alert_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Alert not found")
+        conn.execute(
+            "UPDATE system_alerts SET resolved = 1, resolved_at = ? WHERE id = ?",
+            (_now_ts(), alert_id),
+        )
+        return {"status": "resolved", "id": alert_id}
+
+
+@app.post("/api/jobs/run-queued")
+def run_queued_jobs(limit: int = 5):
+    executed = 0
+    failed = 0
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM job_runs
+            WHERE status = 'queued'
+            ORDER BY COALESCE(next_retry_at, 0) ASC, id ASC
+            LIMIT ?
+            """,
+            (max(1, min(limit, 50)),),
+        ).fetchall()
+        for row in rows:
+            job = dict(row)
+            job_id = int(job["id"])
+            job_type = job.get("job_type")
+            payload = _json_loads(job.get("payload_json"), {})
+            conn.execute(
+                "UPDATE job_runs SET status = 'running', started_at = ?, updated_at = ? WHERE id = ?",
+                (_now_ts(), _now_ts(), job_id),
+            )
+            try:
+                if job_type == "sync_run":
+                    due = fetch_due(conn, int(payload.get("limit") or 5))
+                    expand = os.getenv("SYNC_EXPAND", "true").lower() == "true"
+                    result = {"processed": 0, "failed": 0}
+                    for pid in due:
+                        mark_running(conn, pid)
+                        try:
+                            row = conn.execute("SELECT * FROM papers WHERE id = ?", (pid,)).fetchone()
+                            if not row:
+                                mark_success(conn, pid)
+                                continue
+                            paper = dict(row)
+                            if not paper.get("s2_paper_id"):
+                                s2_record = _resolve_semantic_scholar(paper.get("title"), paper.get("doi"))
+                                if s2_record:
+                                    paper = upsert_paper(conn, s2_record)
+                            new_ids = _sync_citations(conn, paper, paper.get("s2_paper_id"))
+                            if expand and new_ids:
+                                for nid in new_ids:
+                                    enqueue_paper(conn, nid, delay_seconds=600)
+                            mark_success(conn, pid)
+                            result["processed"] += 1
+                        except Exception as exc:
+                            mark_failure(conn, pid, str(exc))
+                            result["failed"] += 1
+                    _finish_job(conn, job_id, result)
+                    executed += 1
+                else:
+                    _fail_job(conn, job_id, f"Unsupported retry job_type: {job_type}")
+                    failed += 1
+            except Exception as exc:
+                _fail_job(conn, job_id, str(exc))
+                failed += 1
+    return {"executed": executed, "failed": failed}
 
 
 @app.get("/api/tasks", response_model=List[ReadingTask])
@@ -1508,7 +2327,15 @@ def quality_merge(payload: MergeRequest):
 
         out_edges = conn.execute(
             """
-            SELECT target_paper_id, confidence, edge_source, evidence, intent, intent_confidence
+            SELECT
+                target_paper_id,
+                confidence,
+                edge_source,
+                evidence,
+                intent,
+                intent_confidence,
+                context_snippet,
+                intent_source
             FROM citations
             WHERE source_paper_id = ?
             """,
@@ -1516,7 +2343,15 @@ def quality_merge(payload: MergeRequest):
         ).fetchall()
         in_edges = conn.execute(
             """
-            SELECT source_paper_id, confidence, edge_source, evidence, intent, intent_confidence
+            SELECT
+                source_paper_id,
+                confidence,
+                edge_source,
+                evidence,
+                intent,
+                intent_confidence,
+                context_snippet,
+                intent_source
             FROM citations
             WHERE target_paper_id = ?
             """,
@@ -1534,6 +2369,8 @@ def quality_merge(payload: MergeRequest):
                 evidence=e["evidence"],
                 intent=e["intent"],
                 intent_confidence=e["intent_confidence"],
+                context_snippet=e["context_snippet"],
+                intent_source=e["intent_source"],
             )
         for e in in_edges:
             if e["source_paper_id"] == target_id:
@@ -1547,6 +2384,8 @@ def quality_merge(payload: MergeRequest):
                 evidence=e["evidence"],
                 intent=e["intent"],
                 intent_confidence=e["intent_confidence"],
+                context_snippet=e["context_snippet"],
+                intent_source=e["intent_source"],
             )
 
         conn.execute(
@@ -1566,7 +2405,12 @@ def quality_merge(payload: MergeRequest):
         conn.execute("UPDATE reading_tasks SET paper_id = ? WHERE paper_id = ?", (target_id, source_id))
         conn.execute("UPDATE experiments SET paper_id = ? WHERE paper_id = ?", (target_id, source_id))
         conn.execute("UPDATE ee_metrics SET paper_id = ? WHERE paper_id = ?", (target_id, source_id))
+        conn.execute("UPDATE ee_metric_cells SET paper_id = ? WHERE paper_id = ?", (target_id, source_id))
         conn.execute("UPDATE paper_chunks SET paper_id = ? WHERE paper_id = ?", (target_id, source_id))
+        conn.execute(
+            "UPDATE paper_schema_concepts SET paper_id = ? WHERE paper_id = ?",
+            (target_id, source_id),
+        )
         conn.execute("UPDATE note_links SET source_paper_id = ? WHERE source_paper_id = ?", (target_id, source_id))
         conn.execute("UPDATE note_links SET target_paper_id = ? WHERE target_paper_id = ?", (target_id, source_id))
         conn.execute(
@@ -1576,6 +2420,16 @@ def quality_merge(payload: MergeRequest):
                 SELECT MIN(id)
                 FROM note_links
                 GROUP BY source_paper_id, target_paper_id, link_text
+            )
+            """
+        )
+        conn.execute(
+            """
+            DELETE FROM paper_schema_concepts
+            WHERE id NOT IN (
+                SELECT MIN(id)
+                FROM paper_schema_concepts
+                GROUP BY paper_id, canonical_concept_id, concept_type
             )
             """
         )
@@ -1674,7 +2528,15 @@ def quality_auto_merge(limit: int = 20, title_threshold: float = 0.96):
                 source = item["id"]
                 out_edges = conn.execute(
                     """
-                    SELECT target_paper_id, confidence, edge_source, evidence, intent, intent_confidence
+                    SELECT
+                        target_paper_id,
+                        confidence,
+                        edge_source,
+                        evidence,
+                        intent,
+                        intent_confidence,
+                        context_snippet,
+                        intent_source
                     FROM citations
                     WHERE source_paper_id = ?
                     """,
@@ -1682,7 +2544,15 @@ def quality_auto_merge(limit: int = 20, title_threshold: float = 0.96):
                 ).fetchall()
                 in_edges = conn.execute(
                     """
-                    SELECT source_paper_id, confidence, edge_source, evidence, intent, intent_confidence
+                    SELECT
+                        source_paper_id,
+                        confidence,
+                        edge_source,
+                        evidence,
+                        intent,
+                        intent_confidence,
+                        context_snippet,
+                        intent_source
                     FROM citations
                     WHERE target_paper_id = ?
                     """,
@@ -1700,6 +2570,8 @@ def quality_auto_merge(limit: int = 20, title_threshold: float = 0.96):
                         evidence=e["evidence"],
                         intent=e["intent"],
                         intent_confidence=e["intent_confidence"],
+                        context_snippet=e["context_snippet"],
+                        intent_source=e["intent_source"],
                     )
                 for e in in_edges:
                     if e["source_paper_id"] == keeper:
@@ -1713,6 +2585,8 @@ def quality_auto_merge(limit: int = 20, title_threshold: float = 0.96):
                         evidence=e["evidence"],
                         intent=e["intent"],
                         intent_confidence=e["intent_confidence"],
+                        context_snippet=e["context_snippet"],
+                        intent_source=e["intent_source"],
                     )
                 conn.execute(
                     "DELETE FROM citations WHERE source_paper_id = ? OR target_paper_id = ?",
@@ -1721,7 +2595,12 @@ def quality_auto_merge(limit: int = 20, title_threshold: float = 0.96):
                 conn.execute("UPDATE reading_tasks SET paper_id = ? WHERE paper_id = ?", (keeper, source))
                 conn.execute("UPDATE experiments SET paper_id = ? WHERE paper_id = ?", (keeper, source))
                 conn.execute("UPDATE ee_metrics SET paper_id = ? WHERE paper_id = ?", (keeper, source))
+                conn.execute("UPDATE ee_metric_cells SET paper_id = ? WHERE paper_id = ?", (keeper, source))
                 conn.execute("UPDATE paper_chunks SET paper_id = ? WHERE paper_id = ?", (keeper, source))
+                conn.execute(
+                    "UPDATE paper_schema_concepts SET paper_id = ? WHERE paper_id = ?",
+                    (keeper, source),
+                )
                 conn.execute("UPDATE note_links SET source_paper_id = ? WHERE source_paper_id = ?", (keeper, source))
                 conn.execute("UPDATE note_links SET target_paper_id = ? WHERE target_paper_id = ?", (keeper, source))
                 conn.execute(
@@ -1731,6 +2610,16 @@ def quality_auto_merge(limit: int = 20, title_threshold: float = 0.96):
                         SELECT MIN(id)
                         FROM note_links
                         GROUP BY source_paper_id, target_paper_id, link_text
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    DELETE FROM paper_schema_concepts
+                    WHERE id NOT IN (
+                        SELECT MIN(id)
+                        FROM paper_schema_concepts
+                        GROUP BY paper_id, canonical_concept_id, concept_type
                     )
                     """
                 )
@@ -1821,21 +2710,65 @@ def chat_with_papers(payload: ChatQueryRequest):
     if not query:
         raise HTTPException(status_code=400, detail="query is required")
     with get_conn() as conn:
-        paper_ids = [int(pid) for pid in payload.paper_ids if pid]
-        contexts = _retrieve_rag_chunks(
+        job_id = _create_job(
             conn,
-            query,
-            paper_ids=paper_ids or None,
-            top_k=max(2, min(payload.top_k, 12)),
+            "chat_papers",
+            {"query": query, "paper_ids": payload.paper_ids, "top_k": payload.top_k},
         )
-        result = chat_with_context(query, contexts, language=payload.language)
-        return {
-            "query": query,
-            "paper_ids": paper_ids,
-            "answer": result.get("answer") or "",
-            "sources": result.get("sources") or [],
-            "context_count": len(contexts),
-        }
+        try:
+            paper_ids = [int(pid) for pid in payload.paper_ids if pid]
+            session_id = payload.session_id
+            if payload.use_memory and not session_id:
+                session = _create_chat_session(conn, title=f"QA: {query[:40]}", language=payload.language)
+                session_id = int(session["id"])
+            memory = _fetch_chat_memory(conn, session_id) if payload.use_memory and session_id else []
+            memory_prompt = "\n".join(
+                [f"{item.get('role')}: {item.get('content')}" for item in memory[-6:]]
+            )
+            effective_query = query if not memory_prompt else f"{query}\n\nConversation memory:\n{memory_prompt}"
+            contexts = _retrieve_rag_contexts(
+                conn,
+                effective_query,
+                paper_ids=paper_ids or None,
+                top_k=max(2, min(payload.top_k, 16)),
+            )
+            result = chat_with_context(query, contexts, language=payload.language)
+            answer = result.get("answer") or ""
+            sources = result.get("sources") or []
+            trace_score = _traceability_score(sources, answer)
+            if session_id:
+                _append_chat_message(conn, session_id, "user", query, paper_ids=paper_ids)
+                _append_chat_message(
+                    conn,
+                    session_id,
+                    "assistant",
+                    answer,
+                    paper_ids=paper_ids,
+                    trace_score=trace_score,
+                    sources=sources,
+                )
+            _finish_job(
+                conn,
+                job_id,
+                {
+                    "session_id": session_id,
+                    "context_count": len(contexts),
+                    "trace_score": trace_score,
+                },
+            )
+            return {
+                "query": query,
+                "paper_ids": paper_ids,
+                "answer": answer,
+                "sources": sources,
+                "context_count": len(contexts),
+                "trace_score": trace_score,
+                "session_id": session_id,
+                "routes": list({ctx.get("route") for ctx in contexts if ctx.get("route")}),
+            }
+        except Exception as exc:
+            _fail_job(conn, job_id, str(exc))
+            raise
 
 
 @app.post("/api/chat/papers/stream")
@@ -1844,24 +2777,76 @@ def chat_with_papers_stream(payload: ChatQueryRequest):
     if not query:
         raise HTTPException(status_code=400, detail="query is required")
     with get_conn() as conn:
-        paper_ids = [int(pid) for pid in payload.paper_ids if pid]
-        contexts = _retrieve_rag_chunks(
+        job_id = _create_job(
             conn,
-            query,
-            paper_ids=paper_ids or None,
-            top_k=max(2, min(payload.top_k, 12)),
+            "chat_papers_stream",
+            {"query": query, "paper_ids": payload.paper_ids, "top_k": payload.top_k},
         )
+        try:
+            paper_ids = [int(pid) for pid in payload.paper_ids if pid]
+            session_id = payload.session_id
+            if payload.use_memory and not session_id:
+                session = _create_chat_session(conn, title=f"QA: {query[:40]}", language=payload.language)
+                session_id = int(session["id"])
+            memory = _fetch_chat_memory(conn, session_id) if payload.use_memory and session_id else []
+            memory_prompt = "\n".join(
+                [f"{item.get('role')}: {item.get('content')}" for item in memory[-6:]]
+            )
+            effective_query = query if not memory_prompt else f"{query}\n\nConversation memory:\n{memory_prompt}"
+            contexts = _retrieve_rag_contexts(
+                conn,
+                effective_query,
+                paper_ids=paper_ids or None,
+                top_k=max(2, min(payload.top_k, 16)),
+            )
+        except Exception as exc:
+            _fail_job(conn, job_id, str(exc))
+            raise
 
     def event_stream():
+        answer_buf: List[str] = []
+        finished_job = False
         init_payload = {
             "type": "meta",
             "query": query,
             "paper_ids": paper_ids,
             "context_count": len(contexts),
+            "session_id": session_id,
+            "routes": list({ctx.get("route") for ctx in contexts if ctx.get("route")}),
         }
         yield f"data: {json.dumps(init_payload, ensure_ascii=False)}\n\n"
         for event in stream_chat_with_context(query, contexts, language=payload.language):
+            if event.get("type") == "delta":
+                answer_buf.append(event.get("delta") or "")
+            if event.get("type") == "sources":
+                trace_score = _traceability_score(event.get("sources") or [], "".join(answer_buf))
+                event["trace_score"] = trace_score
+                if session_id:
+                    with get_conn() as conn:
+                        _append_chat_message(conn, session_id, "user", query, paper_ids=paper_ids)
+                        _append_chat_message(
+                            conn,
+                            session_id,
+                            "assistant",
+                            "".join(answer_buf),
+                            paper_ids=paper_ids,
+                            trace_score=trace_score,
+                            sources=event.get("sources") or [],
+                        )
+                        _finish_job(
+                            conn,
+                            job_id,
+                            {"session_id": session_id, "context_count": len(contexts), "trace_score": trace_score},
+                        )
+                finished_job = True
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        if not finished_job:
+            with get_conn() as conn:
+                _finish_job(
+                    conn,
+                    job_id,
+                    {"session_id": session_id, "context_count": len(contexts), "trace_score": 0.0},
+                )
         yield "data: {\"type\":\"done\"}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -1881,6 +2866,27 @@ def metrics_leaderboard(
 ):
     with get_conn() as conn:
         return _build_metric_leaderboard(conn, dataset=dataset, metric=metric, limit=limit)
+
+
+@app.get("/api/metrics/provenance")
+def metric_provenance(
+    paper_id: Optional[int] = None,
+    dataset: Optional[str] = None,
+    limit: int = 120,
+):
+    with get_conn() as conn:
+        query = "SELECT * FROM ee_metric_cells WHERE 1=1"
+        params: List[Any] = []
+        if paper_id:
+            query += " AND paper_id = ?"
+            params.append(paper_id)
+        if dataset:
+            query += " AND LOWER(dataset_name) = LOWER(?)"
+            params.append(dataset)
+        query += " ORDER BY COALESCE(confidence, 0) DESC, id DESC LIMIT ?"
+        params.append(max(1, min(limit, 1000)))
+        rows = [dict(r) for r in conn.execute(query, params).fetchall()]
+        return {"items": rows, "count": len(rows)}
 
 
 @app.post("/api/papers/compare")
@@ -1929,6 +2935,11 @@ def compare_papers(payload: ComparePapersRequest):
 @app.post("/api/citations/intent/classify")
 def classify_citation_intents(payload: CitationIntentRequest):
     with get_conn() as conn:
+        job_id = _create_job(
+            conn,
+            "citation_intent_classify",
+            {"limit": payload.limit, "edge_ids": payload.edge_ids or []},
+        )
         rows = conn.execute(
             """
             SELECT
@@ -1936,6 +2947,8 @@ def classify_citation_intents(payload: CitationIntentRequest):
                 c.target_paper_id,
                 c.intent,
                 c.intent_confidence,
+                c.context_snippet,
+                c.intent_source,
                 sp.title AS source_title,
                 sp.abstract AS source_abstract,
                 tp.title AS target_title
@@ -1965,18 +2978,20 @@ def classify_citation_intents(payload: CitationIntentRequest):
                 item.get("source_title"),
                 item.get("source_abstract"),
                 item.get("target_title"),
+                citation_context=item.get("context_snippet"),
             )
             intent = out.get("intent") or "mention"
             confidence = float(out.get("confidence") or 0.0)
             conn.execute(
                 """
                 UPDATE citations
-                SET intent = ?, intent_confidence = ?, last_verified_at = ?
+                SET intent = ?, intent_confidence = ?, intent_source = ?, last_verified_at = ?
                 WHERE source_paper_id = ? AND target_paper_id = ?
                 """,
                 (
                     intent,
                     confidence,
+                    "body_context" if item.get("context_snippet") else "metadata",
                     _now_ts(),
                     item["source_paper_id"],
                     item["target_paper_id"],
@@ -1990,8 +3005,10 @@ def classify_citation_intents(payload: CitationIntentRequest):
                     "target": item["target_paper_id"],
                     "intent": intent,
                     "intent_confidence": confidence,
+                    "context_snippet": item.get("context_snippet"),
                 }
             )
+        _finish_job(conn, job_id, {"updated": updated, "pending": len(pending)})
         return {"updated": updated, "items": results}
 
 
@@ -2534,7 +3551,9 @@ def get_graph(
                 confidence,
                 edge_source,
                 intent,
-                intent_confidence
+                intent_confidence,
+                context_snippet,
+                intent_source
             FROM citations
             """
         ).fetchall()
@@ -2556,6 +3575,8 @@ def get_graph(
                         "edge_source": r["edge_source"],
                         "intent": r["intent"],
                         "intent_confidence": r["intent_confidence"],
+                        "context_snippet": r["context_snippet"],
+                        "intent_source": r["intent_source"],
                     }
                 )
 
@@ -2743,7 +3764,9 @@ def graph_neighbors(node_id: int, depth: int = 1, limit: int = 200):
                 confidence,
                 edge_source,
                 intent,
-                intent_confidence
+                intent_confidence,
+                context_snippet,
+                intent_source
             FROM citations
             """
         ).fetchall()
@@ -2778,6 +3801,8 @@ def graph_neighbors(node_id: int, depth: int = 1, limit: int = 200):
                 "edge_source": r["edge_source"],
                 "intent": r["intent"],
                 "intent_confidence": r["intent_confidence"],
+                "context_snippet": r["context_snippet"],
+                "intent_source": r["intent_source"],
             }
             for r in edge_rows
             if r["source_paper_id"] in node_set and r["target_paper_id"] in node_set
@@ -2972,6 +3997,7 @@ def sync_enqueue_one(paper_id: int):
 def sync_run(limit: int = 5):
     results = {"processed": 0, "failed": 0}
     with get_conn() as conn:
+        job_id = _create_job(conn, "sync_run", {"limit": limit})
         _maybe_cleanup(conn)
         due = fetch_due(conn, limit)
         expand = os.getenv("SYNC_EXPAND", "true").lower() == "true"
@@ -2996,13 +4022,23 @@ def sync_run(limit: int = 5):
             except Exception as exc:
                 mark_failure(conn, pid, str(exc))
                 results["failed"] += 1
+        _finish_job(conn, job_id, results)
     return results
 
 
 @app.get("/api/sync/status")
 def sync_status():
     with get_conn() as conn:
-        return queue_stats(conn)
+        base = queue_stats(conn)
+        job_rows = conn.execute(
+            "SELECT status, COUNT(*) AS c FROM job_runs GROUP BY status"
+        ).fetchall()
+        alerts = conn.execute(
+            "SELECT COUNT(*) AS c FROM system_alerts WHERE resolved = 0"
+        ).fetchone()
+        base["jobs"] = {r["status"]: r["c"] for r in job_rows}
+        base["alerts_open"] = alerts["c"] if alerts else 0
+        return base
 
 
 @app.post("/api/maintenance/cleanup")
@@ -3026,10 +4062,23 @@ def backfill_papers(
     references_parsed = 0
     chunks_indexed = 0
     metrics_upserted = 0
+    metric_cells_upserted = 0
     auto_experiments = 0
     schemas_extracted = 0
     touched = False
     with get_conn() as conn:
+        job_id = _create_job(
+            conn,
+            "backfill_papers",
+            {
+                "limit": limit,
+                "summary": summary,
+                "references": references,
+                "embeddings": embeddings,
+                "metrics": metrics,
+                "force": force,
+            },
+        )
         clauses = ["file_path IS NOT NULL"]
         if not force:
             if summary and references:
@@ -3047,6 +4096,12 @@ def backfill_papers(
             processed += 1
             paper = dict(row)
             updates: Dict[str, Any] = {}
+            full_text = ""
+            table_text = ""
+            if paper.get("file_path") and (embeddings or metrics or references):
+                full_text = extract_markdown(paper["file_path"]) or extract_full_text(paper["file_path"])
+                if metrics:
+                    table_text = extract_tables_text(paper["file_path"])
 
             if summary and (force or not paper.get("summary_one")):
                 title = paper.get("title")
@@ -3070,15 +4125,15 @@ def backfill_papers(
                     refs = extract_references(ref_text, max_items=30)
                     if not refs:
                         refs = _extract_dois_from_text(ref_text, limit=30)
-                    _sync_references_from_text(conn, paper, refs)
+                    citation_context_map = extract_citation_context_map(full_text, refs) if full_text else None
+                    _sync_references_from_text(
+                        conn,
+                        paper,
+                        refs,
+                        citation_context_map=citation_context_map,
+                    )
                 updates["refs_parsed_at"] = int(time.time())
                 references_parsed += 1
-
-            full_text = ""
-            table_text = ""
-            if paper.get("file_path") and (embeddings or metrics):
-                full_text = extract_markdown(paper["file_path"]) or extract_full_text(paper["file_path"])
-                table_text = extract_tables_text(paper["file_path"])
 
             if embeddings and full_text:
                 chunks_indexed += _index_paper_chunks(conn, paper["id"], full_text)
@@ -3097,6 +4152,20 @@ def backfill_papers(
                 metric_text = "\n".join([full_text, table_text]).strip()
                 extracted_metrics = extract_ee_metrics(metric_text, limit=40)
                 llm_metrics = extract_reported_metrics(metric_text[:18000], max_items=20)
+                structured = extract_structured_table_metrics(
+                    paper["file_path"],
+                    max_pages=None,
+                    limit=80,
+                )
+                if structured.get("metrics"):
+                    extracted_metrics.extend(structured["metrics"])
+                _upsert_metric_cells(
+                    conn,
+                    paper["id"],
+                    structured.get("cells") or [],
+                    parser="table_structured",
+                )
+                metric_cells_upserted += len(structured.get("cells") or [])
                 if llm_metrics:
                     extracted_metrics.extend(llm_metrics)
                 metrics_upserted += _upsert_ee_metrics(
@@ -3112,12 +4181,27 @@ def backfill_papers(
                 touched = True
         if touched:
             _sync_search_fts(conn)
+        _finish_job(
+            conn,
+            job_id,
+            {
+                "processed": processed,
+                "summary_added": summary_added,
+                "references_parsed": references_parsed,
+                "chunks_indexed": chunks_indexed,
+                "metrics_upserted": metrics_upserted,
+                "metric_cells_upserted": metric_cells_upserted,
+                "auto_experiments": auto_experiments,
+                "schemas_extracted": schemas_extracted,
+            },
+        )
     return {
         "processed": processed,
         "summary_added": summary_added,
         "references_parsed": references_parsed,
         "chunks_indexed": chunks_indexed,
         "metrics_upserted": metrics_upserted,
+        "metric_cells_upserted": metric_cells_upserted,
         "auto_experiments": auto_experiments,
         "schemas_extracted": schemas_extracted,
     }
@@ -3275,10 +4359,16 @@ def _infer_intent_if_enabled(
     source_title: Optional[str],
     source_abstract: Optional[str],
     target_title: Optional[str],
+    citation_context: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[float]]:
     if os.getenv("CITATION_INTENT_AUTO", "false").lower() != "true":
         return None, None
-    result = classify_citation_intent(source_title, source_abstract, target_title)
+    result = classify_citation_intent(
+        source_title,
+        source_abstract,
+        target_title,
+        citation_context=citation_context,
+    )
     intent = result.get("intent")
     confidence = result.get("confidence")
     try:
@@ -3325,6 +4415,7 @@ def _sync_citations(conn, paper_row: Dict[str, Any], s2_paper_id: Optional[str])
             evidence=record.get("doi") or record.get("title"),
             intent=intent,
             intent_confidence=intent_conf,
+            intent_source="metadata" if intent else None,
         )
         if target["id"] != paper_row["id"] and not target.get("file_path"):
             new_ids.append(target["id"])
@@ -3358,6 +4449,7 @@ def _sync_citations(conn, paper_row: Dict[str, Any], s2_paper_id: Optional[str])
             evidence=record.get("doi") or record.get("title"),
             intent=intent,
             intent_confidence=intent_conf,
+            intent_source="metadata" if intent else None,
         )
         if source["id"] != paper_row["id"] and not source.get("file_path"):
             new_ids.append(source["id"])
@@ -3366,10 +4458,14 @@ def _sync_citations(conn, paper_row: Dict[str, Any], s2_paper_id: Optional[str])
 
 
 def _sync_references_from_text(
-    conn, paper_row: Dict[str, Any], references: List[Dict[str, Any]]
+    conn,
+    paper_row: Dict[str, Any],
+    references: List[Dict[str, Any]],
+    citation_context_map: Optional[Dict[str, str]] = None,
 ) -> None:
     if not references:
         return
+    context_map = citation_context_map or {}
     for ref in references:
         title = ref.get("title")
         doi = ref.get("doi")
@@ -3385,10 +4481,20 @@ def _sync_references_from_text(
         )
         target = upsert_paper(conn, record)
         title_sim = title_similarity(title, target.get("title")) if title else 0.6
+        context_key = (str(title or doi or "").strip().lower())[:240]
+        context_snippet = context_map.get(context_key)
+        if not context_snippet and title:
+            # fuzzy fallback by contained title substring
+            title_key = re.sub(r"\s+", " ", str(title).strip().lower())
+            for key, value in context_map.items():
+                if key in title_key or title_key in key:
+                    context_snippet = value
+                    break
         intent, intent_conf = _infer_intent_if_enabled(
             paper_row.get("title"),
             paper_row.get("abstract"),
             target.get("title"),
+            citation_context=context_snippet,
         )
         add_citation_edge(
             conn,
@@ -3403,6 +4509,8 @@ def _sync_references_from_text(
             evidence=doi or title,
             intent=intent,
             intent_confidence=intent_conf,
+            context_snippet=context_snippet,
+            intent_source="body_context" if context_snippet else None,
         )
 
 
@@ -3468,7 +4576,8 @@ def upload_paper(file: UploadFile = File(...)):
             references = extract_references(ref_text, max_items=30)
             if not references:
                 references = _extract_dois_from_text(ref_text, limit=30)
-            _sync_references_from_text(conn, row, references)
+            citation_context_map = extract_citation_context_map(full_text, references)
+            _sync_references_from_text(conn, row, references, citation_context_map=citation_context_map)
         _sync_citations(conn, row, row.get("s2_paper_id"))
         if full_text:
             _index_paper_chunks(conn, row["id"], full_text)
@@ -3482,6 +4591,10 @@ def upload_paper(file: UploadFile = File(...)):
             metric_text = "\n".join([full_text, table_text]).strip()
             metrics = extract_ee_metrics(metric_text, limit=40)
             llm_metrics = extract_reported_metrics(metric_text[:18000], max_items=20)
+            structured = extract_structured_table_metrics(file_path, max_pages=None, limit=80)
+            if structured.get("metrics"):
+                metrics.extend(structured["metrics"])
+            _upsert_metric_cells(conn, row["id"], structured.get("cells") or [], parser="table_structured")
             if llm_metrics:
                 metrics.extend(llm_metrics)
             _upsert_ee_metrics(conn, row["id"], metrics, source="upload")
