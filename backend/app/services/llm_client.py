@@ -31,6 +31,8 @@ class MetadataSchema(BaseModel):
     doi: Optional[str] = None
     abstract: Optional[str] = None
     sub_field: Optional[str] = None
+    proposed_method_name: Optional[str] = None
+    dynamic_tags: Optional[List[str]] = None
 
 
 class ReferenceSchema(BaseModel):
@@ -56,9 +58,11 @@ def _build_prompt(
         example_block = "\n".join(lines) + "\n\n"
     return (
         "You are extracting metadata from an academic paper. "
-        f"{prefix} Keys: title, authors, year, journal_conf, doi, abstract, sub_field.\n"
+        f"{prefix} Keys: title, authors, year, journal_conf, doi, abstract, sub_field, proposed_method_name, dynamic_tags.\n"
         "If unsure, use null. For authors, return a comma-separated string.\n"
-        f"Choose sub_field from: [{fields}]. If none match, return null.\n\n"
+        f"Choose sub_field from: [{fields}]. If none match, return null.\n"
+        "For dynamic_tags, return 3-8 concise open-set tags (strings) for problem setting/method/data.\n"
+        "For proposed_method_name, return the method/model name if present.\n\n"
         f"{example_block}TEXT:\n{raw_text[:12000]}"
     )
 
@@ -81,11 +85,39 @@ def _normalize(data: Dict[str, Any], sub_fields: list[str]) -> Dict[str, Any]:
     if not data:
         return {}
     out: Dict[str, Any] = {}
-    for key in ["title", "authors", "journal_conf", "doi", "abstract", "sub_field"]:
+    for key in [
+        "title",
+        "authors",
+        "journal_conf",
+        "doi",
+        "abstract",
+        "sub_field",
+        "proposed_method_name",
+    ]:
         value = data.get(key)
         if isinstance(value, str):
             value = value.strip() or None
         out[key] = value
+    dynamic_tags = data.get("dynamic_tags")
+    if isinstance(dynamic_tags, str):
+        dynamic_tags = [tag.strip() for tag in dynamic_tags.split(",") if tag.strip()]
+    if isinstance(dynamic_tags, list):
+        normalized_tags = []
+        seen = set()
+        for tag in dynamic_tags:
+            if not isinstance(tag, str):
+                continue
+            clean = tag.strip()
+            if not clean:
+                continue
+            key = clean.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized_tags.append(clean[:60])
+        out["dynamic_tags"] = normalized_tags[:10]
+    else:
+        out["dynamic_tags"] = None
     year = data.get("year")
     if isinstance(year, str) and year.isdigit():
         year = int(year)
@@ -226,6 +258,183 @@ def summarize_one_line(title: Optional[str], abstract: Optional[str]) -> Optiona
     # Try to strip quotes if returned as JSON string
     content = content.strip().strip("\"")
     return content[:300]
+
+
+def chat_with_context(
+    query: str,
+    contexts: List[Dict[str, Any]],
+    language: str = "zh",
+) -> Dict[str, Any]:
+    provider = os.getenv("LLM_PROVIDER", "").strip().lower()
+    api_key = os.getenv("LLM_API_KEY", "").strip()
+    endpoint = os.getenv("LLM_ENDPOINT", "").strip()
+    model = os.getenv("LLM_MODEL", "").strip()
+    if not query.strip():
+        return {"answer": "", "sources": []}
+
+    context_lines = []
+    sources = []
+    for idx, ctx in enumerate(contexts[:8], start=1):
+        title = (ctx.get("title") or "").strip()
+        text = (ctx.get("chunk_text") or ctx.get("text") or "").strip()
+        paper_id = ctx.get("paper_id")
+        if not text:
+            continue
+        context_lines.append(f"[{idx}] (paper_id={paper_id}) {title}\n{text[:1200]}")
+        sources.append(
+            {
+                "paper_id": paper_id,
+                "title": title,
+                "score": ctx.get("score"),
+                "chunk_index": ctx.get("chunk_index"),
+            }
+        )
+    if not context_lines:
+        return {"answer": "未检索到可用上下文。", "sources": []}
+
+    prompt_lang = "Chinese" if language.lower().startswith("zh") else "English"
+    prompt = (
+        f"Answer the user's question in {prompt_lang}.\n"
+        "Use only the provided context. If not enough evidence, say what is missing.\n"
+        "When comparing papers, output compact table-like bullets.\n\n"
+        f"QUESTION:\n{query}\n\n"
+        f"CONTEXT:\n{chr(10).join(context_lines)}"
+    )
+
+    if not provider or not api_key or not endpoint or not model:
+        answer_lines = ["检索到的相关片段如下（未启用LLM回答）："]
+        for idx, ctx in enumerate(contexts[:5], start=1):
+            answer_lines.append(
+                f"{idx}. {ctx.get('title') or 'Untitled'}: {(ctx.get('chunk_text') or '')[:160]}"
+            )
+        return {"answer": "\n".join(answer_lines), "sources": sources}
+
+    headers = {"Authorization": f"Bearer {api_key}"}
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are a precise academic assistant."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+    }
+    try:
+        answer = _call_llm(endpoint, headers, payload).strip()
+    except Exception:
+        answer = ""
+    if not answer:
+        answer = "当前无法生成回答，请稍后重试。"
+    return {"answer": answer[:2400], "sources": sources}
+
+
+def classify_citation_intent(
+    source_title: Optional[str],
+    source_abstract: Optional[str],
+    target_title: Optional[str],
+) -> Dict[str, Any]:
+    provider = os.getenv("LLM_PROVIDER", "").strip().lower()
+    api_key = os.getenv("LLM_API_KEY", "").strip()
+    endpoint = os.getenv("LLM_ENDPOINT", "").strip()
+    model = os.getenv("LLM_MODEL", "").strip()
+    if not source_title or not target_title:
+        return {"intent": "mention", "confidence": 0.35}
+
+    if not provider or not api_key or not endpoint or not model:
+        text = (source_abstract or "").lower()
+        if "baseline" in text or "build on" in text or "following" in text:
+            return {"intent": "build_on", "confidence": 0.55}
+        if "however" in text or "limitation" in text or "challenge" in text:
+            return {"intent": "contrast", "confidence": 0.5}
+        return {"intent": "mention", "confidence": 0.4}
+
+    headers = {"Authorization": f"Bearer {api_key}"}
+    prompt = (
+        "Classify citation intent between source paper and cited paper.\n"
+        "Return JSON with keys: intent, confidence.\n"
+        "intent must be one of: build_on, contrast, use_as_baseline, mention.\n"
+        "confidence in [0,1].\n\n"
+        f"Source title: {source_title}\n"
+        f"Source abstract: {source_abstract or ''}\n"
+        f"Cited title: {target_title}\n"
+    )
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You classify citation intent."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.0,
+    }
+    if os.getenv("LLM_RESPONSE_JSON", "").strip().lower() == "true":
+        payload["response_format"] = {"type": "json_object"}
+    try:
+        content = _call_llm(endpoint, headers, payload)
+        parsed = _parse_json(content)
+        intent = str(parsed.get("intent") or "mention").strip()
+        confidence = parsed.get("confidence")
+        try:
+            conf = float(confidence)
+        except Exception:
+            conf = 0.45
+        if intent not in {"build_on", "contrast", "use_as_baseline", "mention"}:
+            intent = "mention"
+        return {"intent": intent, "confidence": round(max(0.0, min(1.0, conf)), 4)}
+    except Exception:
+        return {"intent": "mention", "confidence": 0.4}
+
+
+def extract_reported_metrics(raw_text: str, max_items: int = 30) -> List[Dict[str, Any]]:
+    provider = os.getenv("LLM_PROVIDER", "").strip().lower()
+    api_key = os.getenv("LLM_API_KEY", "").strip()
+    endpoint = os.getenv("LLM_ENDPOINT", "").strip()
+    model = os.getenv("LLM_MODEL", "").strip()
+    if not provider or not api_key or not endpoint or not model:
+        return []
+    if not raw_text:
+        return []
+    headers = {"Authorization": f"Bearer {api_key}"}
+    prompt = (
+        "Extract event extraction benchmark metrics from the paper text.\n"
+        "Return JSON array with fields: dataset_name, precision, recall, f1, trigger_f1, argument_f1, confidence.\n"
+        f"Limit {max_items} items. Use null if unknown.\n\n"
+        f"TEXT:\n{raw_text[:14000]}"
+    )
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You extract benchmark metrics from NLP papers."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.1,
+    }
+    if os.getenv("LLM_RESPONSE_JSON", "").strip().lower() == "true":
+        payload["response_format"] = {"type": "json_object"}
+    try:
+        content = _call_llm(endpoint, headers, payload)
+    except Exception:
+        return []
+    data = _parse_json(content)
+    if isinstance(data, dict):
+        items = data.get("items") or data.get("metrics") or data.get("data")
+    else:
+        items = data
+    if not isinstance(items, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for item in items[:max_items]:
+        if not isinstance(item, dict):
+            continue
+        metric = {
+            "dataset_name": item.get("dataset_name"),
+            "precision": item.get("precision"),
+            "recall": item.get("recall"),
+            "f1": item.get("f1"),
+            "trigger_f1": item.get("trigger_f1"),
+            "argument_f1": item.get("argument_f1"),
+            "confidence": item.get("confidence"),
+        }
+        out.append(metric)
+    return out
 
 
 def extract_references(raw_text: str, max_items: int = 30) -> List[Dict[str, Any]]:

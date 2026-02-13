@@ -7,7 +7,7 @@ import threading
 import time
 import json
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 import hashlib
 
@@ -34,8 +34,22 @@ from .schemas import (
     ExperimentUpdate,
 )
 from .services.crossref import lookup_doi
-from .services.llm_client import enrich_metadata, summarize_one_line, extract_references
-from .services.pdf_extract import extract_metadata, extract_text, extract_references_text
+from .services.llm_client import (
+    enrich_metadata,
+    summarize_one_line,
+    extract_references,
+    chat_with_context,
+    classify_citation_intent,
+    extract_reported_metrics,
+)
+from .services.pdf_extract import (
+    extract_metadata,
+    extract_text,
+    extract_references_text,
+    extract_full_text,
+    chunk_text,
+    extract_ee_metrics,
+)
 from .services.semantic_scholar import (
     extract_paper_from_edge,
     get_citations,
@@ -70,6 +84,7 @@ from .services.search_quality import (
     title_similarity,
 )
 from .services.analytics import build_progress_snapshot, build_topic_evolution, to_period
+from .services.rag import text_to_embedding, embedding_to_json, rank_chunks
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STORAGE_DIR = os.path.join(BASE_DIR, "storage", "pdfs")
@@ -270,6 +285,9 @@ def _sync_search_fts(conn) -> None:
             p.id,
             p.title,
             p.abstract,
+            p.proposed_method_name,
+            p.dynamic_tags,
+            p.keywords,
             n.method,
             n.datasets,
             n.conclusions,
@@ -289,6 +307,9 @@ def _sync_search_fts(conn) -> None:
                 row["reproducibility"] or "",
                 row["risks"] or "",
                 row["notes"] or "",
+                row["proposed_method_name"] or "",
+                row["keywords"] or "",
+                " ".join(_normalize_open_tags(row["dynamic_tags"])),
             ]
         ).strip()
         conn.execute(
@@ -304,6 +325,9 @@ def _collect_search_documents(conn) -> List[SearchDocument]:
             p.id,
             p.title,
             p.abstract,
+            p.proposed_method_name,
+            p.dynamic_tags,
+            p.keywords,
             n.method,
             n.datasets,
             n.conclusions,
@@ -324,6 +348,9 @@ def _collect_search_documents(conn) -> List[SearchDocument]:
                 r["reproducibility"] or "",
                 r["risks"] or "",
                 r["notes"] or "",
+                r["proposed_method_name"] or "",
+                r["keywords"] or "",
+                " ".join(_normalize_open_tags(r["dynamic_tags"])),
             ]
         ).strip()
         docs.append(
@@ -335,6 +362,257 @@ def _collect_search_documents(conn) -> List[SearchDocument]:
             )
         )
     return docs
+
+
+def _index_paper_chunks(conn, paper_id: int, full_text: str) -> int:
+    chunks = chunk_text(full_text, chunk_size=900, overlap=160)
+    conn.execute("DELETE FROM paper_chunks WHERE paper_id = ?", (paper_id,))
+    now_ts = _now_ts()
+    vectors: List[List[float]] = []
+    for chunk in chunks:
+        vector = text_to_embedding(chunk["text"])
+        vectors.append(vector)
+        conn.execute(
+            """
+            INSERT INTO paper_chunks (paper_id, chunk_index, chunk_text, chunk_embedding, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                paper_id,
+                chunk["index"],
+                chunk["text"],
+                embedding_to_json(vector),
+                now_ts,
+            ),
+        )
+    # Store coarse paper embedding for future indexing.
+    if vectors:
+        dim = len(vectors[0])
+        avg = [0.0] * dim
+        for vec in vectors:
+            for i in range(dim):
+                avg[i] += vec[i]
+        count = float(len(vectors))
+        avg = [round(v / count, 8) for v in avg]
+        repo_update_paper(conn, paper_id, {"embedding": embedding_to_json(avg)})
+    return len(chunks)
+
+
+def _retrieve_rag_chunks(
+    conn,
+    query: str,
+    paper_ids: Optional[List[int]] = None,
+    top_k: int = 6,
+) -> List[Dict[str, Any]]:
+    if paper_ids:
+        placeholders = ",".join(["?"] * len(paper_ids))
+        rows = conn.execute(
+            f"""
+            SELECT
+                c.paper_id,
+                c.chunk_index,
+                c.chunk_text,
+                c.chunk_embedding,
+                p.title
+            FROM paper_chunks c
+            JOIN papers p ON p.id = c.paper_id
+            WHERE c.paper_id IN ({placeholders})
+            """,
+            paper_ids,
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT
+                c.paper_id,
+                c.chunk_index,
+                c.chunk_text,
+                c.chunk_embedding,
+                p.title
+            FROM paper_chunks c
+            JOIN papers p ON p.id = c.paper_id
+            ORDER BY c.created_at DESC
+            LIMIT 3000
+            """
+        ).fetchall()
+    chunks = [dict(r) for r in rows]
+    return rank_chunks(query, chunks, top_k=top_k)
+
+
+def _upsert_ee_metrics(
+    conn,
+    paper_id: int,
+    metrics: List[Dict[str, Any]],
+    source: str,
+) -> int:
+    if not metrics:
+        return 0
+    now_ts = _now_ts()
+    inserted = 0
+    # Keep the latest extraction snapshot by source.
+    conn.execute(
+        "DELETE FROM ee_metrics WHERE paper_id = ? AND source = ?",
+        (paper_id, source),
+    )
+    for item in metrics:
+        dataset = item.get("dataset_name")
+        if not dataset:
+            continue
+        conn.execute(
+            """
+            INSERT INTO ee_metrics (
+                paper_id, dataset_name, precision, recall, f1, trigger_f1, argument_f1, source, confidence, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                paper_id,
+                dataset,
+                item.get("precision"),
+                item.get("recall"),
+                item.get("f1"),
+                item.get("trigger_f1"),
+                item.get("argument_f1"),
+                source,
+                item.get("confidence"),
+                now_ts,
+            ),
+        )
+        inserted += 1
+    return inserted
+
+
+def _normalize_open_tags(tags: Any) -> List[str]:
+    if isinstance(tags, str):
+        parsed = _json_loads(tags, None)
+        if isinstance(parsed, list):
+            tags = parsed
+        else:
+            tags = [x.strip() for x in tags.split(",") if x.strip()]
+    if not isinstance(tags, list):
+        return []
+    seen = set()
+    out = []
+    for tag in tags:
+        if not isinstance(tag, str):
+            continue
+        clean = tag.strip()
+        if not clean:
+            continue
+        key = clean.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(clean[:60])
+    return out[:12]
+
+
+def _discover_open_subfields(conn, limit: int = 100) -> List[str]:
+    rows = conn.execute(
+        """
+        SELECT dynamic_tags, keywords, sub_field
+        FROM papers
+        WHERE dynamic_tags IS NOT NULL OR keywords IS NOT NULL
+        ORDER BY updated_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    freq: Dict[str, int] = {}
+    existing = {r["name"].lower() for r in conn.execute("SELECT name FROM subfields").fetchall()}
+    for row in rows:
+        tags = _normalize_open_tags(row["dynamic_tags"])
+        if not tags and row["keywords"]:
+            tags = [x.strip() for x in str(row["keywords"]).split(",") if x.strip()]
+        for tag in tags:
+            low = tag.lower()
+            if len(low) < 4:
+                continue
+            if low in existing:
+                continue
+            if low in {"event extraction", "nlp"}:
+                continue
+            freq[tag] = freq.get(tag, 0) + 1
+    candidates = [tag for tag, c in sorted(freq.items(), key=lambda x: x[1], reverse=True) if c >= 2]
+    return candidates[:20]
+
+
+def _cluster_open_tags(candidates: List[str]) -> List[Dict[str, Any]]:
+    groups: Dict[str, Dict[str, Any]] = {}
+    for tag in candidates:
+        key = re.sub(r"[^a-z0-9]+", " ", tag.lower()).strip()
+        if not key:
+            continue
+        tokens = [t for t in key.split() if len(t) >= 3]
+        if not tokens:
+            continue
+        cluster_key = " ".join(tokens[:2])
+        row = groups.setdefault(cluster_key, {"label": tag, "members": [], "count": 0})
+        row["members"].append(tag)
+        row["count"] += 1
+        if len(tag) < len(row["label"]):
+            row["label"] = tag
+    ranked = sorted(groups.values(), key=lambda x: (x["count"], len(x["members"])), reverse=True)
+    return ranked[:20]
+
+
+def _build_sota_board(conn, dataset: Optional[str] = None, limit: int = 50) -> Dict[str, Any]:
+    params: List[Any] = []
+    where = ""
+    if dataset:
+        where = "WHERE LOWER(m.dataset_name) = LOWER(?)"
+        params.append(dataset)
+    query = f"""
+        SELECT
+            m.*,
+            p.title,
+            p.year,
+            p.sub_field,
+            p.ccf_level,
+            p.doi,
+            p.url
+        FROM ee_metrics m
+        JOIN papers p ON p.id = m.paper_id
+        {where}
+        ORDER BY COALESCE(m.f1, m.argument_f1, m.trigger_f1, 0) DESC, COALESCE(p.year, 0) DESC
+        LIMIT ?
+    """
+    params.append(max(1, min(limit, 200)))
+    rows = [dict(r) for r in conn.execute(query, params).fetchall()]
+    datasets = sorted({(r.get("dataset_name") or "").strip() for r in rows if r.get("dataset_name")})
+    return {"dataset": dataset, "items": rows, "datasets": datasets, "count": len(rows)}
+
+
+def _get_shortest_path(
+    conn,
+    source_id: int,
+    target_id: int,
+    direction: str = "any",
+) -> Dict[str, Any]:
+    rows = conn.execute("SELECT source_paper_id, target_paper_id FROM citations").fetchall()
+    edges = [(int(r["source_paper_id"]), int(r["target_paper_id"])) for r in rows]
+    if not edges:
+        return {"nodes": [], "edges": [], "distance": None}
+    try:
+        import networkx as nx
+    except Exception:
+        return {"nodes": [], "edges": [], "distance": None}
+
+    if direction == "out":
+        graph = nx.DiGraph()
+    elif direction == "in":
+        graph = nx.DiGraph()
+        edges = [(b, a) for a, b in edges]
+    else:
+        graph = nx.Graph()
+    graph.add_edges_from(edges)
+    try:
+        node_path = nx.shortest_path(graph, source=source_id, target=target_id)
+    except Exception:
+        return {"nodes": [], "edges": [], "distance": None}
+    if len(node_path) < 2:
+        return {"nodes": node_path, "edges": [], "distance": 0}
+    edge_path = [(int(node_path[i]), int(node_path[i + 1])) for i in range(len(node_path) - 1)]
+    return {"nodes": node_path, "edges": edge_path, "distance": len(edge_path)}
 
 
 def _spaced_next_interval(current_days: int) -> int:
@@ -528,6 +806,22 @@ class ZoteroMappingTemplateRequest(BaseModel):
     mapping: Dict[str, str]
 
 
+class ChatQueryRequest(BaseModel):
+    paper_ids: List[int] = []
+    query: str
+    top_k: int = 6
+    language: str = "zh"
+
+
+class CitationIntentRequest(BaseModel):
+    edge_ids: List[str] | None = None
+    limit: int = 50
+
+
+class ComparePapersRequest(BaseModel):
+    paper_ids: List[int]
+
+
 @app.get("/api/papers", response_model=List[Paper])
 def list_papers():
     with get_conn() as conn:
@@ -544,7 +838,38 @@ def search_papers(q: str, top_k: int = 20):
     with get_conn() as conn:
         docs = _collect_search_documents(conn)
         ranked = hybrid_search(query, docs, top_k=max(1, min(top_k, 100)))
-        if not ranked:
+        chunk_hits = _retrieve_rag_chunks(conn, query, top_k=max(6, min(top_k * 2, 30)))
+        chunk_score_map: Dict[int, float] = {}
+        best_chunk_map: Dict[int, Dict[str, Any]] = {}
+        for hit in chunk_hits:
+            pid = int(hit.get("paper_id"))
+            score = float(hit.get("score") or 0.0)
+            if score > chunk_score_map.get(pid, 0.0):
+                chunk_score_map[pid] = score
+                best_chunk_map[pid] = hit
+
+        # Merge doc-level and chunk-level scores.
+        rank_map: Dict[int, Dict[str, float]] = {}
+        for item in ranked:
+            pid = int(item["doc_id"])
+            rank_map[pid] = {
+                "score": float(item.get("score", 0.0)),
+                "bm25_score": float(item.get("bm25_score", 0.0)),
+                "semantic_score": float(item.get("semantic_score", 0.0)),
+                "chunk_score": chunk_score_map.get(pid, 0.0),
+            }
+        for pid, chunk_score in chunk_score_map.items():
+            if pid not in rank_map:
+                rank_map[pid] = {
+                    "score": 0.0,
+                    "bm25_score": 0.0,
+                    "semantic_score": 0.0,
+                    "chunk_score": chunk_score,
+                }
+            rank_map[pid]["score"] = max(rank_map[pid]["score"], rank_map[pid]["score"] * 0.72 + chunk_score * 0.48)
+
+        rank_items = sorted(rank_map.items(), key=lambda x: x[1]["score"], reverse=True)[: max(1, min(top_k, 100))]
+        if not rank_items:
             fallback_rows = conn.execute(
                 """
                 SELECT * FROM papers
@@ -566,8 +891,8 @@ def search_papers(q: str, top_k: int = 20):
                     }
                 )
             return {"query": query, "results": fallback, "fallback": True}
-        doc_scores = {int(item["doc_id"]): item for item in ranked}
-        ids = list(doc_scores.keys())
+        ids = [pid for pid, _ in rank_items]
+        doc_scores = {pid: score for pid, score in rank_items}
         placeholders = ",".join(["?"] * len(ids))
         rows = conn.execute(
             f"SELECT * FROM papers WHERE id IN ({placeholders})",
@@ -589,15 +914,24 @@ def search_papers(q: str, top_k: int = 20):
             score = doc_scores[pid]
             notes = notes_map.get(pid) or {}
             note_text = notes.get("notes") or notes.get("conclusions") or notes.get("method") or ""
-            snippet_source = paper.get("abstract") or note_text or paper.get("title") or ""
+            best_chunk = best_chunk_map.get(pid)
+            snippet_source = (
+                (best_chunk or {}).get("chunk_text")
+                or paper.get("abstract")
+                or note_text
+                or paper.get("title")
+                or ""
+            )
             snippet = snippet_source[:220]
             results.append(
                 {
                     "paper": paper,
-                    "score": score["score"],
-                    "bm25_score": score["bm25_score"],
-                    "semantic_score": score["semantic_score"],
+                    "score": score.get("score", 0.0),
+                    "bm25_score": score.get("bm25_score", 0.0),
+                    "semantic_score": max(score.get("semantic_score", 0.0), score.get("chunk_score", 0.0)),
+                    "chunk_score": score.get("chunk_score", 0.0),
                     "snippet": snippet,
+                    "chunk_index": best_chunk.get("chunk_index") if best_chunk else None,
                 }
             )
         return {"query": query, "results": results, "fallback": False}
@@ -741,8 +1075,10 @@ def create_experiment(payload: ExperimentCreate):
         conn.execute(
             """
             INSERT INTO experiments (
-                paper_id, name, model, params_json, metrics_json, result_summary, artifact_path, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                paper_id, name, model, params_json, metrics_json, result_summary, artifact_path,
+                dataset_name, trigger_f1, argument_f1, precision, recall, f1,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload.paper_id,
@@ -752,6 +1088,12 @@ def create_experiment(payload: ExperimentCreate):
                 payload.metrics_json,
                 payload.result_summary,
                 payload.artifact_path,
+                payload.dataset_name,
+                payload.trigger_f1,
+                payload.argument_f1,
+                payload.precision,
+                payload.recall,
+                payload.f1,
                 now_ts,
                 now_ts,
             ),
@@ -820,11 +1162,19 @@ def quality_merge(payload: MergeRequest):
         target = dict(target_row)
 
         out_edges = conn.execute(
-            "SELECT target_paper_id, confidence, edge_source, evidence FROM citations WHERE source_paper_id = ?",
+            """
+            SELECT target_paper_id, confidence, edge_source, evidence, intent, intent_confidence
+            FROM citations
+            WHERE source_paper_id = ?
+            """,
             (source_id,),
         ).fetchall()
         in_edges = conn.execute(
-            "SELECT source_paper_id, confidence, edge_source, evidence FROM citations WHERE target_paper_id = ?",
+            """
+            SELECT source_paper_id, confidence, edge_source, evidence, intent, intent_confidence
+            FROM citations
+            WHERE target_paper_id = ?
+            """,
             (source_id,),
         ).fetchall()
         for e in out_edges:
@@ -837,6 +1187,8 @@ def quality_merge(payload: MergeRequest):
                 confidence=e["confidence"] or 0.8,
                 edge_source=e["edge_source"],
                 evidence=e["evidence"],
+                intent=e["intent"],
+                intent_confidence=e["intent_confidence"],
             )
         for e in in_edges:
             if e["source_paper_id"] == target_id:
@@ -848,6 +1200,8 @@ def quality_merge(payload: MergeRequest):
                 confidence=e["confidence"] or 0.8,
                 edge_source=e["edge_source"],
                 evidence=e["evidence"],
+                intent=e["intent"],
+                intent_confidence=e["intent_confidence"],
             )
 
         conn.execute(
@@ -930,11 +1284,19 @@ def quality_auto_merge(limit: int = 20, title_threshold: float = 0.96):
             for item in paper_rows[1:]:
                 source = item["id"]
                 out_edges = conn.execute(
-                    "SELECT target_paper_id, confidence, edge_source, evidence FROM citations WHERE source_paper_id = ?",
+                    """
+                    SELECT target_paper_id, confidence, edge_source, evidence, intent, intent_confidence
+                    FROM citations
+                    WHERE source_paper_id = ?
+                    """,
                     (source,),
                 ).fetchall()
                 in_edges = conn.execute(
-                    "SELECT source_paper_id, confidence, edge_source, evidence FROM citations WHERE target_paper_id = ?",
+                    """
+                    SELECT source_paper_id, confidence, edge_source, evidence, intent, intent_confidence
+                    FROM citations
+                    WHERE target_paper_id = ?
+                    """,
                     (source,),
                 ).fetchall()
                 for e in out_edges:
@@ -947,6 +1309,8 @@ def quality_auto_merge(limit: int = 20, title_threshold: float = 0.96):
                         confidence=e["confidence"] or 0.8,
                         edge_source=e["edge_source"],
                         evidence=e["evidence"],
+                        intent=e["intent"],
+                        intent_confidence=e["intent_confidence"],
                     )
                 for e in in_edges:
                     if e["source_paper_id"] == keeper:
@@ -958,6 +1322,8 @@ def quality_auto_merge(limit: int = 20, title_threshold: float = 0.96):
                         confidence=e["confidence"] or 0.8,
                         edge_source=e["edge_source"],
                         evidence=e["evidence"],
+                        intent=e["intent"],
+                        intent_confidence=e["intent_confidence"],
                     )
                 conn.execute(
                     "DELETE FROM citations WHERE source_paper_id = ? OR target_paper_id = ?",
@@ -980,6 +1346,203 @@ def topic_evolution():
     with get_conn() as conn:
         rows = [dict(r) for r in conn.execute("SELECT * FROM papers").fetchall()]
         return build_topic_evolution(rows)
+
+
+@app.get("/api/analytics/topic-river")
+def topic_river():
+    with get_conn() as conn:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM papers").fetchall()]
+        evolution = build_topic_evolution(rows)
+        return {
+            "river": evolution.get("river", []),
+            "years": evolution.get("years", []),
+            "sub_fields": evolution.get("sub_fields", []),
+            "bursts": evolution.get("bursts", []),
+        }
+
+
+@app.get("/api/subfields/discover-open-tags")
+def discover_open_tags(limit: int = 200, add_to_subfields: bool = False):
+    with get_conn() as conn:
+        candidates = _discover_open_subfields(conn, limit=max(20, min(limit, 1000)))
+        clusters = _cluster_open_tags(candidates)
+        added = 0
+        if add_to_subfields:
+            existing = {r["name"].lower() for r in conn.execute("SELECT name FROM subfields").fetchall()}
+            for row in clusters:
+                label = row.get("label")
+                if not isinstance(label, str):
+                    continue
+                name = label.strip()
+                if not name or name.lower() in existing:
+                    continue
+                conn.execute(
+                    "INSERT INTO subfields (name, description, active, created_at) VALUES (?, ?, 1, ?)",
+                    (name, "Auto-discovered from open tags", _now_ts()),
+                )
+                existing.add(name.lower())
+                added += 1
+        return {"candidates": candidates, "clusters": clusters, "added": added}
+
+
+@app.post("/api/chat/papers")
+def chat_with_papers(payload: ChatQueryRequest):
+    query = (payload.query or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query is required")
+    with get_conn() as conn:
+        paper_ids = [int(pid) for pid in payload.paper_ids if pid]
+        contexts = _retrieve_rag_chunks(
+            conn,
+            query,
+            paper_ids=paper_ids or None,
+            top_k=max(2, min(payload.top_k, 12)),
+        )
+        result = chat_with_context(query, contexts, language=payload.language)
+        return {
+            "query": query,
+            "paper_ids": paper_ids,
+            "answer": result.get("answer") or "",
+            "sources": result.get("sources") or [],
+            "context_count": len(contexts),
+        }
+
+
+@app.get("/api/metrics/sota")
+def metrics_sota(dataset: Optional[str] = None, limit: int = 50):
+    with get_conn() as conn:
+        return _build_sota_board(conn, dataset=dataset, limit=limit)
+
+
+@app.post("/api/papers/compare")
+def compare_papers(payload: ComparePapersRequest):
+    paper_ids = [int(pid) for pid in payload.paper_ids if pid]
+    if not paper_ids:
+        raise HTTPException(status_code=400, detail="paper_ids is required")
+    with get_conn() as conn:
+        placeholders = ",".join(["?"] * len(paper_ids))
+        papers = [dict(r) for r in conn.execute(
+            f"SELECT * FROM papers WHERE id IN ({placeholders})",
+            paper_ids,
+        ).fetchall()]
+        metrics_rows = [dict(r) for r in conn.execute(
+            f"""
+            SELECT
+                m.paper_id,
+                m.dataset_name,
+                m.precision,
+                m.recall,
+                m.f1,
+                m.trigger_f1,
+                m.argument_f1,
+                m.confidence
+            FROM ee_metrics m
+            WHERE m.paper_id IN ({placeholders})
+            ORDER BY COALESCE(m.f1, m.argument_f1, m.trigger_f1, 0) DESC
+            """,
+            paper_ids,
+        ).fetchall()]
+        metrics_map: Dict[int, List[Dict[str, Any]]] = {}
+        for row in metrics_rows:
+            metrics_map.setdefault(int(row["paper_id"]), []).append(row)
+        result = []
+        for paper in papers:
+            result.append(
+                {
+                    "paper": paper,
+                    "metrics": metrics_map.get(int(paper["id"]), []),
+                    "tags": _normalize_open_tags(paper.get("dynamic_tags")),
+                }
+            )
+        return {"items": result, "count": len(result)}
+
+
+@app.post("/api/citations/intent/classify")
+def classify_citation_intents(payload: CitationIntentRequest):
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                c.source_paper_id,
+                c.target_paper_id,
+                c.intent,
+                c.intent_confidence,
+                sp.title AS source_title,
+                sp.abstract AS source_abstract,
+                tp.title AS target_title
+            FROM citations c
+            JOIN papers sp ON sp.id = c.source_paper_id
+            JOIN papers tp ON tp.id = c.target_paper_id
+            ORDER BY COALESCE(c.last_verified_at, 0) DESC
+            """
+        ).fetchall()
+
+        edge_filter = set(payload.edge_ids or [])
+        pending: List[Dict[str, Any]] = []
+        for row in rows:
+            edge_id = f"{row['source_paper_id']}->{row['target_paper_id']}"
+            if edge_filter and edge_id not in edge_filter:
+                continue
+            if not edge_filter and row["intent"] and row["intent_confidence"] is not None:
+                continue
+            pending.append(dict(row))
+            if len(pending) >= max(1, min(payload.limit, 200)):
+                break
+
+        updated = 0
+        results: List[Dict[str, Any]] = []
+        for item in pending:
+            out = classify_citation_intent(
+                item.get("source_title"),
+                item.get("source_abstract"),
+                item.get("target_title"),
+            )
+            intent = out.get("intent") or "mention"
+            confidence = float(out.get("confidence") or 0.0)
+            conn.execute(
+                """
+                UPDATE citations
+                SET intent = ?, intent_confidence = ?, last_verified_at = ?
+                WHERE source_paper_id = ? AND target_paper_id = ?
+                """,
+                (
+                    intent,
+                    confidence,
+                    _now_ts(),
+                    item["source_paper_id"],
+                    item["target_paper_id"],
+                ),
+            )
+            updated += 1
+            results.append(
+                {
+                    "id": f"{item['source_paper_id']}->{item['target_paper_id']}",
+                    "source": item["source_paper_id"],
+                    "target": item["target_paper_id"],
+                    "intent": intent,
+                    "intent_confidence": confidence,
+                }
+            )
+        return {"updated": updated, "items": results}
+
+
+@app.get("/api/graph/shortest-path")
+def graph_shortest_path(source_id: int, target_id: int, direction: str = "any"):
+    direction = direction.lower().strip()
+    if direction not in {"any", "out", "in"}:
+        raise HTTPException(status_code=400, detail="direction must be any/out/in")
+    with get_conn() as conn:
+        path = _get_shortest_path(conn, source_id=source_id, target_id=target_id, direction=direction)
+        if not path["nodes"]:
+            return {"source_id": source_id, "target_id": target_id, "path": path, "papers": []}
+        placeholders = ",".join(["?"] * len(path["nodes"]))
+        rows = conn.execute(
+            f"SELECT id, title, year, sub_field FROM papers WHERE id IN ({placeholders})",
+            path["nodes"],
+        ).fetchall()
+        paper_map = {r["id"]: dict(r) for r in rows}
+        papers = [paper_map.get(pid, {"id": pid}) for pid in path["nodes"]]
+        return {"source_id": source_id, "target_id": target_id, "path": path, "papers": papers}
 
 
 @app.post("/api/reports/generate")
@@ -1495,7 +2058,16 @@ def get_graph(
         node_ids = {p["id"] for p in nodes_raw}
 
         edge_rows = conn.execute(
-            "SELECT source_paper_id, target_paper_id, confidence, edge_source FROM citations"
+            """
+            SELECT
+                source_paper_id,
+                target_paper_id,
+                confidence,
+                edge_source,
+                intent,
+                intent_confidence
+            FROM citations
+            """
         ).fetchall()
         edges = []
         current_year = datetime.now().year
@@ -1513,6 +2085,8 @@ def get_graph(
                         "target": target,
                         "confidence": conf,
                         "edge_source": r["edge_source"],
+                        "intent": r["intent"],
+                        "intent_confidence": r["intent_confidence"],
                     }
                 )
 
@@ -1642,6 +2216,8 @@ def get_graph(
                     "zotero_library": p.get("zotero_library"),
                     "zotero_item_id": p.get("zotero_item_id"),
                     "summary_one": p.get("summary_one"),
+                    "proposed_method_name": p.get("proposed_method_name"),
+                    "dynamic_tags": _normalize_open_tags(p.get("dynamic_tags")),
                     "open_tasks": task["open"],
                     "overdue_tasks": task["overdue"],
                     "experiment_count": exp_stats.get(p["id"], 0),
@@ -1690,7 +2266,16 @@ def graph_neighbors(node_id: int, depth: int = 1, limit: int = 200):
         papers = {r["id"]: dict(r) for r in rows}
 
         edge_rows = conn.execute(
-            "SELECT source_paper_id, target_paper_id, confidence, edge_source FROM citations"
+            """
+            SELECT
+                source_paper_id,
+                target_paper_id,
+                confidence,
+                edge_source,
+                intent,
+                intent_confidence
+            FROM citations
+            """
         ).fetchall()
         adjacency: Dict[int, List[int]] = {}
         reverse: Dict[int, List[int]] = {}
@@ -1721,6 +2306,8 @@ def graph_neighbors(node_id: int, depth: int = 1, limit: int = 200):
                 "target": r["target_paper_id"],
                 "confidence": r["confidence"] if r["confidence"] is not None else 1.0,
                 "edge_source": r["edge_source"],
+                "intent": r["intent"],
+                "intent_confidence": r["intent_confidence"],
             }
             for r in edge_rows
             if r["source_paper_id"] in node_set and r["target_paper_id"] in node_set
@@ -1785,6 +2372,9 @@ def graph_neighbors(node_id: int, depth: int = 1, limit: int = 200):
                     "reference_count": p.get("reference_count"),
                     "doi": p.get("doi"),
                     "url": p.get("url"),
+                    "summary_one": p.get("summary_one"),
+                    "proposed_method_name": p.get("proposed_method_name"),
+                    "dynamic_tags": _normalize_open_tags(p.get("dynamic_tags")),
                     "open_tasks": task["open"],
                     "overdue_tasks": task["overdue"],
                     "experiment_count": exp_stats.get(p["id"], 0),
@@ -1956,11 +2546,15 @@ def backfill_papers(
     limit: int = 10,
     summary: bool = True,
     references: bool = True,
+    embeddings: bool = True,
+    metrics: bool = True,
     force: bool = False,
 ):
     processed = 0
     summary_added = 0
     references_parsed = 0
+    chunks_indexed = 0
+    metrics_upserted = 0
     touched = False
     with get_conn() as conn:
         clauses = ["file_path IS NOT NULL"]
@@ -2007,6 +2601,24 @@ def backfill_papers(
                 updates["refs_parsed_at"] = int(time.time())
                 references_parsed += 1
 
+            full_text = ""
+            if paper.get("file_path") and (embeddings or metrics):
+                full_text = extract_full_text(paper["file_path"])
+
+            if embeddings and full_text:
+                chunks_indexed += _index_paper_chunks(conn, paper["id"], full_text)
+                touched = True
+
+            if metrics and full_text:
+                extracted_metrics = extract_ee_metrics(full_text, limit=40)
+                llm_metrics = extract_reported_metrics(full_text[:18000], max_items=20)
+                if llm_metrics:
+                    extracted_metrics.extend(llm_metrics)
+                metrics_upserted += _upsert_ee_metrics(
+                    conn, paper["id"], extracted_metrics, source="backfill"
+                )
+                touched = True
+
             if updates:
                 repo_update_paper(conn, paper["id"], updates)
                 touched = True
@@ -2016,6 +2628,8 @@ def backfill_papers(
         "processed": processed,
         "summary_added": summary_added,
         "references_parsed": references_parsed,
+        "chunks_indexed": chunks_indexed,
+        "metrics_upserted": metrics_upserted,
     }
 
 def _contains_cjk(text: Optional[str]) -> bool:
@@ -2115,6 +2729,10 @@ def _merge_metadata(
     data["doi"] = llm_data.get("doi") or extracted.doi
     data["abstract"] = llm_data.get("abstract") or extracted.abstract
     data["sub_field"] = llm_data.get("sub_field")
+    data["proposed_method_name"] = llm_data.get("proposed_method_name")
+    dynamic_tags = _normalize_open_tags(llm_data.get("dynamic_tags"))
+    if dynamic_tags:
+        data["dynamic_tags"] = _json_dumps(dynamic_tags)
     if s2_data:
         data.update({k: v for k, v in s2_data.items() if v is not None})
     if not data.get("ccf_level"):
@@ -2162,6 +2780,23 @@ def _resolve_semantic_scholar(
     return to_paper_record(match)
 
 
+def _infer_intent_if_enabled(
+    source_title: Optional[str],
+    source_abstract: Optional[str],
+    target_title: Optional[str],
+) -> Tuple[Optional[str], Optional[float]]:
+    if os.getenv("CITATION_INTENT_AUTO", "false").lower() != "true":
+        return None, None
+    result = classify_citation_intent(source_title, source_abstract, target_title)
+    intent = result.get("intent")
+    confidence = result.get("confidence")
+    try:
+        conf_value = float(confidence) if confidence is not None else None
+    except Exception:
+        conf_value = None
+    return intent, conf_value
+
+
 def _sync_citations(conn, paper_row: Dict[str, Any], s2_paper_id: Optional[str]) -> List[int]:
     if not s2_paper_id:
         return []
@@ -2181,6 +2816,11 @@ def _sync_citations(conn, paper_row: Dict[str, Any], s2_paper_id: Optional[str])
         )
         target = upsert_paper(conn, record)
         sim = title_similarity(record.get("title"), target.get("title"))
+        intent, intent_conf = _infer_intent_if_enabled(
+            paper_row.get("title"),
+            paper_row.get("abstract"),
+            target.get("title"),
+        )
         add_citation_edge(
             conn,
             paper_row["id"],
@@ -2192,6 +2832,8 @@ def _sync_citations(conn, paper_row: Dict[str, Any], s2_paper_id: Optional[str])
             ),
             edge_source="semantic_scholar",
             evidence=record.get("doi") or record.get("title"),
+            intent=intent,
+            intent_confidence=intent_conf,
         )
         if target["id"] != paper_row["id"] and not target.get("file_path"):
             new_ids.append(target["id"])
@@ -2207,6 +2849,11 @@ def _sync_citations(conn, paper_row: Dict[str, Any], s2_paper_id: Optional[str])
         )
         source = upsert_paper(conn, record)
         sim = title_similarity(record.get("title"), source.get("title"))
+        intent, intent_conf = _infer_intent_if_enabled(
+            source.get("title"),
+            source.get("abstract"),
+            paper_row.get("title"),
+        )
         add_citation_edge(
             conn,
             source["id"],
@@ -2218,6 +2865,8 @@ def _sync_citations(conn, paper_row: Dict[str, Any], s2_paper_id: Optional[str])
             ),
             edge_source="semantic_scholar",
             evidence=record.get("doi") or record.get("title"),
+            intent=intent,
+            intent_confidence=intent_conf,
         )
         if source["id"] != paper_row["id"] and not source.get("file_path"):
             new_ids.append(source["id"])
@@ -2245,6 +2894,11 @@ def _sync_references_from_text(
         )
         target = upsert_paper(conn, record)
         title_sim = title_similarity(title, target.get("title")) if title else 0.6
+        intent, intent_conf = _infer_intent_if_enabled(
+            paper_row.get("title"),
+            paper_row.get("abstract"),
+            target.get("title"),
+        )
         add_citation_edge(
             conn,
             paper_row["id"],
@@ -2256,6 +2910,8 @@ def _sync_references_from_text(
             ),
             edge_source="llm_reference",
             evidence=doi or title,
+            intent=intent,
+            intent_confidence=intent_conf,
         )
 
 
@@ -2280,6 +2936,7 @@ def upload_paper(file: UploadFile = File(...)):
     with open(file_path, "rb") as f:
         file_hash = hashlib.sha256(f.read()).hexdigest()
     raw_text = extract_text(file_path, max_pages=3)
+    full_text = extract_full_text(file_path)
     with get_conn() as conn:
         subfields = _get_active_subfields(conn)
         examples = _get_subfield_examples(conn)
@@ -2308,6 +2965,10 @@ def upload_paper(file: UploadFile = File(...)):
     with get_conn() as conn:
         merged.setdefault("read_status", 0)
         row = upsert_paper(conn, merged)
+        if row.get("sub_field"):
+            feedback_text = f"{row.get('title') or ''}\n{row.get('abstract') or ''}".strip()
+            if feedback_text:
+                _record_subfield_feedback(conn, row["id"], feedback_text, row["sub_field"])
         ref_text = extract_references_text(file_path)
         if ref_text:
             references = extract_references(ref_text, max_items=30)
@@ -2315,7 +2976,15 @@ def upload_paper(file: UploadFile = File(...)):
                 references = _extract_dois_from_text(ref_text, limit=30)
             _sync_references_from_text(conn, row, references)
         _sync_citations(conn, row, row.get("s2_paper_id"))
+        if full_text:
+            _index_paper_chunks(conn, row["id"], full_text)
+            metrics = extract_ee_metrics(full_text, limit=40)
+            llm_metrics = extract_reported_metrics(full_text[:18000], max_items=20)
+            if llm_metrics:
+                metrics.extend(llm_metrics)
+            _upsert_ee_metrics(conn, row["id"], metrics, source="upload")
         enqueue_paper(conn, row["id"], delay_seconds=0)
         _sync_search_fts(conn)
+        row = conn.execute("SELECT * FROM papers WHERE id = ?", (row["id"],)).fetchone()
 
     return Paper(**dict(row))

@@ -64,7 +64,23 @@ def build_clusters(papers: List[Dict]) -> Dict[int, str]:
     texts = []
     ids = []
     for p in papers:
-        text = p.get("keywords") or p.get("abstract") or p.get("title")
+        dynamic_tags = p.get("dynamic_tags")
+        if isinstance(dynamic_tags, str) and dynamic_tags.startswith("["):
+            try:
+                import json
+
+                parsed = json.loads(dynamic_tags)
+                if isinstance(parsed, list):
+                    dynamic_tags = ", ".join([str(x) for x in parsed if x])
+            except Exception:
+                pass
+        text = (
+            dynamic_tags
+            or p.get("keywords")
+            or p.get("proposed_method_name")
+            or p.get("abstract")
+            or p.get("title")
+        )
         if not text:
             continue
         texts.append(text)

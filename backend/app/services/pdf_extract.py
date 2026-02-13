@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 import fitz  # PyMuPDF
 
@@ -165,6 +165,50 @@ def extract_text(pdf_path: str, max_pages: int = 2) -> str:
     return "\n".join(texts)
 
 
+def extract_full_text(pdf_path: str, max_pages: Optional[int] = None) -> str:
+    try:
+        with fitz.open(pdf_path) as doc:
+            texts: list[str] = []
+            page_cap = doc.page_count if max_pages is None else min(max_pages, doc.page_count)
+            for i in range(page_cap):
+                texts.append(doc.load_page(i).get_text("text"))
+    except Exception:
+        return ""
+    return "\n".join(texts)
+
+
+def chunk_text(text: str, chunk_size: int = 900, overlap: int = 160) -> List[Dict[str, Any]]:
+    content = re.sub(r"\s+", " ", text or "").strip()
+    if not content:
+        return []
+    if chunk_size <= overlap:
+        chunk_size = overlap + 120
+    chunks: List[Dict[str, Any]] = []
+    start = 0
+    index = 0
+    length = len(content)
+    while start < length:
+        end = min(length, start + chunk_size)
+        # Try to cut on sentence boundary.
+        if end < length:
+            pivot = max(
+                content.rfind("。", start, end),
+                content.rfind(".", start, end),
+                content.rfind("!", start, end),
+                content.rfind("?", start, end),
+            )
+            if pivot > start + 120:
+                end = pivot + 1
+        chunk = content[start:end].strip()
+        if chunk:
+            chunks.append({"index": index, "text": chunk})
+            index += 1
+        if end >= length:
+            break
+        start = max(start + 1, end - overlap)
+    return chunks
+
+
 def extract_metadata(pdf_path: str, max_pages: int = 2) -> ExtractedMetadata:
     text = extract_text(pdf_path, max_pages=max_pages)
     lines = [line for line in text.splitlines() if _clean_line(line)]
@@ -209,3 +253,100 @@ def extract_references_text(pdf_path: str, tail_pages: int = 4) -> Optional[str]
     if len(text) < 400:
         return None
     return text
+
+
+def _to_metric(value: str) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        num = float(value)
+    except ValueError:
+        return None
+    if num > 100:
+        return None
+    if 0 < num <= 1:
+        return round(num * 100, 3)
+    return round(num, 3)
+
+
+def extract_ee_metrics(text: str, limit: int = 40) -> List[Dict[str, Any]]:
+    if not text:
+        return []
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    dataset_aliases = [
+        "ACE2005",
+        "ACE 2005",
+        "ACE05",
+        "MAVEN",
+        "RAMS",
+        "WikiEvents",
+        "RichERE",
+        "ERE",
+        "CASIE",
+        "FewEvent",
+    ]
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for line in lines:
+        low = line.lower()
+        dataset = None
+        for alias in dataset_aliases:
+            if alias.lower() in low:
+                dataset = alias.replace(" ", "")
+                break
+        if not dataset:
+            continue
+
+        # P/R/F1 pattern
+        prf = re.search(
+            r"\bP(?:recision)?\s*[:=]?\s*(\d+(?:\.\d+)?)\b.*?\bR(?:ecall)?\s*[:=]?\s*(\d+(?:\.\d+)?)\b.*?\bF1?\s*[:=]?\s*(\d+(?:\.\d+)?)\b",
+            line,
+            re.IGNORECASE,
+        )
+        if prf:
+            precision = _to_metric(prf.group(1))
+            recall = _to_metric(prf.group(2))
+            f1 = _to_metric(prf.group(3))
+            key = (dataset, precision, recall, f1, None, None)
+            if key not in seen:
+                seen.add(key)
+                out.append(
+                    {
+                        "dataset_name": dataset,
+                        "precision": precision,
+                        "recall": recall,
+                        "f1": f1,
+                        "trigger_f1": None,
+                        "argument_f1": None,
+                        "source": line[:280],
+                        "confidence": 0.8,
+                    }
+                )
+            if len(out) >= limit:
+                break
+
+        # Trigger/Argument F1 pattern
+        trig = re.search(r"trigger\s*f1\s*[:=]?\s*(\d+(?:\.\d+)?)", line, re.IGNORECASE)
+        arg = re.search(r"argument\s*f1\s*[:=]?\s*(\d+(?:\.\d+)?)", line, re.IGNORECASE)
+        if trig or arg:
+            trigger_f1 = _to_metric(trig.group(1)) if trig else None
+            argument_f1 = _to_metric(arg.group(1)) if arg else None
+            key = (dataset, None, None, None, trigger_f1, argument_f1)
+            if key not in seen:
+                seen.add(key)
+                out.append(
+                    {
+                        "dataset_name": dataset,
+                        "precision": None,
+                        "recall": None,
+                        "f1": None,
+                        "trigger_f1": trigger_f1,
+                        "argument_f1": argument_f1,
+                        "source": line[:280],
+                        "confidence": 0.72,
+                    }
+                )
+            if len(out) >= limit:
+                break
+    return out

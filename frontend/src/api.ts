@@ -29,6 +29,9 @@ export type Paper = {
   zotero_library?: string | null;
   zotero_item_id?: number | null;
   summary_one?: string | null;
+  proposed_method_name?: string | null;
+  dynamic_tags?: string | null;
+  embedding?: string | null;
   created_at?: number | null;
   updated_at?: number | null;
 };
@@ -55,6 +58,8 @@ export type GraphNode = {
   zotero_library?: string | null;
   zotero_item_id?: number | null;
   summary_one?: string | null;
+  proposed_method_name?: string | null;
+  dynamic_tags?: string[] | null;
   open_tasks?: number | null;
   overdue_tasks?: number | null;
   experiment_count?: number | null;
@@ -66,6 +71,8 @@ export type GraphEdge = {
   target: number;
   confidence?: number;
   edge_source?: string | null;
+  intent?: string | null;
+  intent_confidence?: number | null;
 };
 
 export type GraphResponse = {
@@ -133,6 +140,12 @@ export type Experiment = {
   metrics_json?: string | null;
   result_summary?: string | null;
   artifact_path?: string | null;
+  dataset_name?: string | null;
+  trigger_f1?: number | null;
+  argument_f1?: number | null;
+  precision?: number | null;
+  recall?: number | null;
+  f1?: number | null;
   created_at?: number | null;
   updated_at?: number | null;
 };
@@ -142,6 +155,8 @@ export type SearchResult = {
   score: number;
   bm25_score: number;
   semantic_score: number;
+  chunk_score?: number;
+  chunk_index?: number | null;
   snippet?: string;
 };
 
@@ -168,6 +183,99 @@ export type TopicEvolution = {
     growth: number;
     growth_ratio: number;
   }>;
+};
+
+export type TopicRiver = {
+  river: Array<{
+    year: number;
+    sub_field: string;
+    count: number;
+    ratio: number;
+  }>;
+  years: number[];
+  sub_fields: string[];
+  bursts: TopicEvolution["bursts"];
+};
+
+export type ChatWithPapersResponse = {
+  query: string;
+  paper_ids: number[];
+  answer: string;
+  sources: Array<{
+    paper_id?: number;
+    title?: string;
+    score?: number;
+    chunk_index?: number;
+  }>;
+  context_count: number;
+};
+
+export type SotaBoard = {
+  dataset?: string | null;
+  items: Array<{
+    id: number;
+    paper_id: number;
+    dataset_name?: string | null;
+    precision?: number | null;
+    recall?: number | null;
+    f1?: number | null;
+    trigger_f1?: number | null;
+    argument_f1?: number | null;
+    source?: string | null;
+    confidence?: number | null;
+    title?: string | null;
+    year?: number | null;
+    sub_field?: string | null;
+    ccf_level?: string | null;
+    doi?: string | null;
+    url?: string | null;
+  }>;
+  datasets: string[];
+  count: number;
+};
+
+export type OpenTagDiscovery = {
+  candidates: string[];
+  clusters: Array<{
+    label: string;
+    members: string[];
+    count: number;
+  }>;
+  added: number;
+};
+
+export type ShortestPathResponse = {
+  source_id: number;
+  target_id: number;
+  path: {
+    nodes: number[];
+    edges: Array<[number, number]>;
+    distance: number | null;
+  };
+  papers: Array<{
+    id: number;
+    title?: string | null;
+    year?: number | null;
+    sub_field?: string | null;
+  }>;
+};
+
+export type ComparePapersResponse = {
+  items: Array<{
+    paper: Paper;
+    metrics: Array<{
+      paper_id: number;
+      dataset_name?: string | null;
+      precision?: number | null;
+      recall?: number | null;
+      f1?: number | null;
+      trigger_f1?: number | null;
+      argument_f1?: number | null;
+      confidence?: number | null;
+    }>;
+    tags: string[];
+  }>;
+  count: number;
 };
 
 export type Report = {
@@ -366,8 +474,16 @@ export async function backfillPapers(params?: {
   limit?: number;
   summary?: boolean;
   references?: boolean;
+  embeddings?: boolean;
+  metrics?: boolean;
   force?: boolean;
-}): Promise<{ processed: number; summary_added: number; references_parsed: number }> {
+}): Promise<{
+  processed: number;
+  summary_added: number;
+  references_parsed: number;
+  chunks_indexed?: number;
+  metrics_upserted?: number;
+}> {
   const res = await axios.post(`${API_BASE}/api/papers/backfill`, null, { params });
   return res.data;
 }
@@ -439,6 +555,12 @@ export async function createExperiment(payload: {
   metrics_json?: string;
   result_summary?: string;
   artifact_path?: string;
+  dataset_name?: string;
+  trigger_f1?: number;
+  argument_f1?: number;
+  precision?: number;
+  recall?: number;
+  f1?: number;
 }): Promise<Experiment> {
   const res = await axios.post(`${API_BASE}/api/experiments`, payload);
   return res.data;
@@ -446,7 +568,13 @@ export async function createExperiment(payload: {
 
 export async function updateExperiment(
   experimentId: number,
-  payload: Partial<Pick<Experiment, "name" | "model" | "params_json" | "metrics_json" | "result_summary" | "artifact_path">>
+  payload: Partial<
+    Pick<
+      Experiment,
+      "name" | "model" | "params_json" | "metrics_json" | "result_summary" | "artifact_path" |
+      "dataset_name" | "trigger_f1" | "argument_f1" | "precision" | "recall" | "f1"
+    >
+  >
 ): Promise<Experiment> {
   const res = await axios.patch(`${API_BASE}/api/experiments/${experimentId}`, payload);
   return res.data;
@@ -494,6 +622,68 @@ export async function autoMerge(params?: {
 
 export async function fetchTopicEvolution(): Promise<TopicEvolution> {
   const res = await axios.get(`${API_BASE}/api/analytics/topic-evolution`);
+  return res.data;
+}
+
+export async function fetchTopicRiver(): Promise<TopicRiver> {
+  const res = await axios.get(`${API_BASE}/api/analytics/topic-river`);
+  return res.data;
+}
+
+export async function chatWithPapers(payload: {
+  query: string;
+  paper_ids?: number[];
+  top_k?: number;
+  language?: "zh" | "en";
+}): Promise<ChatWithPapersResponse> {
+  const res = await axios.post(`${API_BASE}/api/chat/papers`, payload);
+  return res.data;
+}
+
+export async function fetchSotaBoard(params?: {
+  dataset?: string;
+  limit?: number;
+}): Promise<SotaBoard> {
+  const res = await axios.get(`${API_BASE}/api/metrics/sota`, { params });
+  return res.data;
+}
+
+export async function discoverOpenTags(params?: {
+  limit?: number;
+  add_to_subfields?: boolean;
+}): Promise<OpenTagDiscovery> {
+  const res = await axios.get(`${API_BASE}/api/subfields/discover-open-tags`, { params });
+  return res.data;
+}
+
+export async function classifyCitationIntent(payload: {
+  edge_ids?: string[];
+  limit?: number;
+}): Promise<{
+  updated: number;
+  items: Array<{
+    id: string;
+    source: number;
+    target: number;
+    intent: string;
+    intent_confidence: number;
+  }>;
+}> {
+  const res = await axios.post(`${API_BASE}/api/citations/intent/classify`, payload);
+  return res.data;
+}
+
+export async function fetchShortestPath(params: {
+  source_id: number;
+  target_id: number;
+  direction?: "any" | "out" | "in";
+}): Promise<ShortestPathResponse> {
+  const res = await axios.get(`${API_BASE}/api/graph/shortest-path`, { params });
+  return res.data;
+}
+
+export async function comparePapers(payload: { paper_ids: number[] }): Promise<ComparePapersResponse> {
+  const res = await axios.post(`${API_BASE}/api/papers/compare`, payload);
   return res.data;
 }
 

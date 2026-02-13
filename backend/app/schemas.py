@@ -34,6 +34,9 @@ class Paper(BaseModel):
     refs_parsed_at: int | None = None
     created_at: int | None = None
     updated_at: int | None = None
+    proposed_method_name: str | None = None
+    dynamic_tags: str | None = None
+    embedding: str | None = None
 
 
 class PaperCreate(BaseModel):
@@ -66,6 +69,9 @@ class PaperCreate(BaseModel):
     refs_parsed_at: int | None = None
     created_at: int | None = None
     updated_at: int | None = None
+    proposed_method_name: str | None = None
+    dynamic_tags: str | None = None
+    embedding: str | None = None
 
 
 class PaperUpdate(BaseModel):
@@ -75,6 +81,8 @@ class PaperUpdate(BaseModel):
     zotero_item_id: int | None = None
     sub_field: str | None = None
     summary_one: str | None = None
+    proposed_method_name: str | None = None
+    dynamic_tags: str | None = None
 
 
 class PaperNote(BaseModel):
@@ -139,6 +147,12 @@ class Experiment(BaseModel):
     metrics_json: str | None = None
     result_summary: str | None = None
     artifact_path: str | None = None
+    dataset_name: str | None = None
+    trigger_f1: float | None = None
+    argument_f1: float | None = None
+    precision: float | None = None
+    recall: float | None = None
+    f1: float | None = None
     created_at: int | None = None
     updated_at: int | None = None
 
@@ -151,6 +165,12 @@ class ExperimentCreate(BaseModel):
     metrics_json: str | None = None
     result_summary: str | None = None
     artifact_path: str | None = None
+    dataset_name: str | None = None
+    trigger_f1: float | None = None
+    argument_f1: float | None = None
+    precision: float | None = None
+    recall: float | None = None
+    f1: float | None = None
 
 
 class ExperimentUpdate(BaseModel):
@@ -160,6 +180,12 @@ class ExperimentUpdate(BaseModel):
     metrics_json: str | None = None
     result_summary: str | None = None
     artifact_path: str | None = None
+    dataset_name: str | None = None
+    trigger_f1: float | None = None
+    argument_f1: float | None = None
+    precision: float | None = None
+    recall: float | None = None
+    f1: float | None = None
 
 
 class Subfield(BaseModel):

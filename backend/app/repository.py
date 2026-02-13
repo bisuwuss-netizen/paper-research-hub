@@ -37,6 +37,9 @@ PAPER_FIELDS = [
     "refs_parsed_at",
     "created_at",
     "updated_at",
+    "proposed_method_name",
+    "dynamic_tags",
+    "embedding",
 ]
 
 
@@ -173,14 +176,16 @@ def add_citation_edge(
     confidence: float = 1.0,
     edge_source: str | None = None,
     evidence: str | None = None,
+    intent: str | None = None,
+    intent_confidence: float | None = None,
 ) -> None:
     try:
         conn.execute(
             """
             INSERT INTO citations (
-                source_paper_id, target_paper_id, confidence, edge_source, evidence, last_verified_at
+                source_paper_id, target_paper_id, confidence, edge_source, evidence, intent, intent_confidence, last_verified_at
             )
-            VALUES (?, ?, ?, ?, ?, strftime('%s','now'))
+            VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))
             ON CONFLICT(source_paper_id, target_paper_id) DO UPDATE SET
                 confidence = CASE
                     WHEN excluded.confidence > COALESCE(citations.confidence, 0)
@@ -189,9 +194,11 @@ def add_citation_edge(
                 END,
                 edge_source = COALESCE(excluded.edge_source, citations.edge_source),
                 evidence = COALESCE(excluded.evidence, citations.evidence),
+                intent = COALESCE(excluded.intent, citations.intent),
+                intent_confidence = COALESCE(excluded.intent_confidence, citations.intent_confidence),
                 last_verified_at = strftime('%s','now')
             """,
-            (source_id, target_id, confidence, edge_source, evidence),
+            (source_id, target_id, confidence, edge_source, evidence, intent, intent_confidence),
         )
     except Exception:
         return

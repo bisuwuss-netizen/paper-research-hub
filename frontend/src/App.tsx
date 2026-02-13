@@ -27,8 +27,10 @@ import {
   fetchDuplicateGroups,
   fetchPapers,
   fetchReports,
+  fetchSotaBoard,
   fetchTasks,
   fetchTopicEvolution,
+  fetchTopicRiver,
   fetchZoteroLogs,
   fetchZoteroTemplate,
   generateReport,
@@ -42,12 +44,15 @@ import {
   type ReadingTask,
   type Report,
   type SearchResult,
+  type SotaBoard,
   type TopicEvolution,
+  type TopicRiver,
   type ZoteroSyncLog
 } from "./api";
 import GraphView from "./GraphView";
 import { createT, type Lang } from "./i18n";
 import "./styles.css";
+import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
 const { Header, Content } = Layout;
 
@@ -77,6 +82,9 @@ function DashboardPage({
   const [taskLoading, setTaskLoading] = useState(false);
 
   const [topicEvolution, setTopicEvolution] = useState<TopicEvolution | null>(null);
+  const [topicRiver, setTopicRiver] = useState<TopicRiver | null>(null);
+  const [sotaBoard, setSotaBoard] = useState<SotaBoard | null>(null);
+  const [sotaDataset, setSotaDataset] = useState<string | undefined>();
   const [reports, setReports] = useState<Report[]>([]);
   const [insightLoading, setInsightLoading] = useState(false);
 
@@ -141,6 +149,22 @@ function DashboardPage({
     return { overdue, reviewDue, done };
   }, [tasks]);
 
+  const riverData = useMemo(() => {
+    if (!topicRiver) return [];
+    const topSubFields = topicRiver.sub_fields.slice(0, 8);
+    const yearMap = new Map<number, Record<string, number>>();
+    topicRiver.years.forEach((year) => {
+      yearMap.set(year, { year } as unknown as Record<string, number>);
+    });
+    topicRiver.river.forEach((item) => {
+      if (!topSubFields.includes(item.sub_field)) return;
+      const row = yearMap.get(item.year) || ({ year: item.year } as unknown as Record<string, number>);
+      row[item.sub_field] = item.count;
+      yearMap.set(item.year, row);
+    });
+    return Array.from(yearMap.values()).sort((a, b) => Number(a.year) - Number(b.year));
+  }, [topicRiver]);
+
   const refreshTasks = async () => {
     setTaskLoading(true);
     try {
@@ -154,9 +178,16 @@ function DashboardPage({
   const refreshInsights = async () => {
     setInsightLoading(true);
     try {
-      const [evolution, reportRows] = await Promise.all([fetchTopicEvolution(), fetchReports({ limit: 20 })]);
+      const [evolution, river, reportRows, sota] = await Promise.all([
+        fetchTopicEvolution(),
+        fetchTopicRiver(),
+        fetchReports({ limit: 20 }),
+        fetchSotaBoard({ dataset: sotaDataset, limit: 50 })
+      ]);
       setTopicEvolution(evolution);
+      setTopicRiver(river);
       setReports(reportRows);
+      setSotaBoard(sota);
     } finally {
       setInsightLoading(false);
     }
@@ -193,6 +224,11 @@ function DashboardPage({
     refreshZotero();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    refreshInsights();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sotaDataset]);
 
   return (
     <>
@@ -371,22 +407,77 @@ function DashboardPage({
                     <Button onClick={refreshInsights} loading={insightLoading}>{t("btn.refresh")}</Button>
                   </Space>
                 </div>
-                <Card size="small" title={t("insight.trends")}> 
+                <Card size="small" title={t("insight.trends")}>
+                  <div style={{ width: "100%", height: 260 }}>
+                    <ResponsiveContainer>
+                      <AreaChart data={riverData}>
+                        <defs>
+                          {topicRiver?.sub_fields.slice(0, 8).map((field, idx) => (
+                            <linearGradient id={`river-${idx}`} key={field} x1="0" y1="0" x2="0" y2="1">
+                              <stop offset="5%" stopColor={`hsl(${(idx * 47) % 360}, 70%, 45%)`} stopOpacity={0.7} />
+                              <stop offset="95%" stopColor={`hsl(${(idx * 47) % 360}, 70%, 45%)`} stopOpacity={0.12} />
+                            </linearGradient>
+                          ))}
+                        </defs>
+                        <CartesianGrid strokeDasharray="3 3" />
+                        <XAxis dataKey="year" />
+                        <YAxis />
+                        <Tooltip />
+                        {topicRiver?.sub_fields.slice(0, 8).map((field, idx) => (
+                          <Area
+                            key={field}
+                            type="monotone"
+                            dataKey={field}
+                            stackId="1"
+                            stroke={`hsl(${(idx * 47) % 360}, 70%, 45%)`}
+                            fill={`url(#river-${idx})`}
+                          />
+                        ))}
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </div>
                   <List
-                    dataSource={topicEvolution?.trends || []}
+                    size="small"
+                    dataSource={topicEvolution?.bursts || []}
                     locale={{ emptyText: "-" }}
                     renderItem={(item) => (
                       <List.Item>
-                        <Space direction="vertical" size={0} style={{ width: "100%" }}>
-                          <Typography.Text strong>{item.year} ({item.total})</Typography.Text>
-                          <Typography.Text type="secondary">
-                            {Object.entries(item.sub_fields)
-                              .map(([name, count]) => `${name}:${count}`)
-                              .join(" | ")}
-                          </Typography.Text>
-                        </Space>
+                        <Typography.Text>
+                          {item.year} · {item.sub_field} · +{item.growth} ({Math.round(item.growth_ratio * 100)}%)
+                        </Typography.Text>
                       </List.Item>
                     )}
+                  />
+                </Card>
+                <Card size="small" title={t("insight.sota")}>
+                  <Space wrap style={{ marginBottom: 8 }}>
+                    <Select
+                      allowClear
+                      style={{ width: 220 }}
+                      value={sotaDataset}
+                      placeholder={t("insight.dataset")}
+                      options={(sotaBoard?.datasets || []).map((d) => ({ label: d, value: d }))}
+                      onChange={(value) => setSotaDataset(value)}
+                    />
+                    <Button onClick={refreshInsights} loading={insightLoading}>
+                      {t("btn.refresh")}
+                    </Button>
+                  </Space>
+                  <Table
+                    size="small"
+                    rowKey="id"
+                    pagination={{ pageSize: 6 }}
+                    dataSource={sotaBoard?.items || []}
+                    columns={[
+                      { title: t("insight.paper"), dataIndex: "title", key: "title", ellipsis: true },
+                      { title: t("insight.dataset"), dataIndex: "dataset_name", key: "dataset_name", width: 130 },
+                      { title: "P", dataIndex: "precision", key: "precision", width: 76 },
+                      { title: "R", dataIndex: "recall", key: "recall", width: 76 },
+                      { title: "F1", dataIndex: "f1", key: "f1", width: 76 },
+                      { title: t("insight.trigger_f1"), dataIndex: "trigger_f1", key: "trigger_f1", width: 96 },
+                      { title: t("insight.argument_f1"), dataIndex: "argument_f1", key: "argument_f1", width: 96 },
+                      { title: t("table.year"), dataIndex: "year", key: "year", width: 76 }
+                    ]}
                   />
                 </Card>
                 <Card size="small" title={t("report.list")}>

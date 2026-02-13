@@ -54,6 +54,9 @@ PAPERS_COLUMNS = {
     "refs_parsed_at": "INTEGER",
     "created_at": "INTEGER",
     "updated_at": "INTEGER",
+    "proposed_method_name": "TEXT",
+    "dynamic_tags": "TEXT",
+    "embedding": "TEXT",
 }
 
 
@@ -62,6 +65,18 @@ CITATIONS_COLUMNS = {
     "edge_source": "TEXT",
     "last_verified_at": "INTEGER",
     "evidence": "TEXT",
+    "intent": "TEXT",
+    "intent_confidence": "REAL",
+}
+
+
+EXPERIMENTS_COLUMNS = {
+    "dataset_name": "TEXT",
+    "trigger_f1": "REAL",
+    "argument_f1": "REAL",
+    "precision": "REAL",
+    "recall": "REAL",
+    "f1": "REAL",
 }
 
 
@@ -198,6 +213,38 @@ def ensure_db() -> None:
             );
             """
         )
+        _ensure_columns(conn, "experiments", EXPERIMENTS_COLUMNS)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS paper_chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                paper_id INTEGER,
+                chunk_index INTEGER,
+                chunk_text TEXT,
+                chunk_embedding TEXT,
+                created_at INTEGER,
+                FOREIGN KEY(paper_id) REFERENCES papers(id)
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ee_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                paper_id INTEGER,
+                dataset_name TEXT,
+                precision REAL,
+                recall REAL,
+                f1 REAL,
+                trigger_f1 REAL,
+                argument_f1 REAL,
+                source TEXT,
+                confidence REAL,
+                created_at INTEGER,
+                FOREIGN KEY(paper_id) REFERENCES papers(id)
+            );
+            """
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS zotero_mapping_templates (
@@ -281,6 +328,12 @@ def ensure_db() -> None:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_zotero_logs_created ON zotero_sync_logs(created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chunks_paper ON paper_chunks(paper_id, chunk_index)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ee_metrics_paper ON ee_metrics(paper_id)"
         )
         conn.execute("UPDATE papers SET read_status = 0 WHERE read_status IS NULL")
         conn.execute(

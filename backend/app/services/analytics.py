@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import json
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Tuple
 
@@ -25,11 +26,35 @@ def build_topic_evolution(papers: List[Dict]) -> Dict:
     year_totals: Dict[int, int] = defaultdict(int)
     hot_papers_by_year: Dict[int, List[Dict]] = defaultdict(list)
 
+    def topic_of(p: Dict) -> str:
+        sub = p.get("sub_field")
+        if sub:
+            return str(sub)
+        tags = p.get("dynamic_tags")
+        if isinstance(tags, str) and tags.strip():
+            parsed = None
+            try:
+                parsed = json.loads(tags)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, list) and parsed:
+                return str(parsed[0])
+            if "," in tags:
+                first = tags.split(",")[0].strip()
+                if first:
+                    return first
+        keywords = p.get("keywords")
+        if isinstance(keywords, str) and keywords.strip():
+            first = keywords.split(",")[0].strip()
+            if first:
+                return first
+        return "Unknown"
+
     for p in papers:
         year = p.get("year")
         if not year:
             continue
-        sub = p.get("sub_field") or "Unknown"
+        sub = topic_of(p)
         by_year_subfield[int(year)][sub] += 1
         year_totals[int(year)] += 1
 
@@ -96,7 +121,38 @@ def build_topic_evolution(papers: List[Dict]) -> Dict:
             prev = curr
 
     bursts.sort(key=lambda x: (x["growth_ratio"], x["count"]), reverse=True)
-    return {"trends": trends, "hotspots": hotspots, "bursts": bursts[:20]}
+    all_years = sorted(by_year_subfield.keys())
+    all_subfields = sorted(
+        {
+            topic_of(p)
+            for p in papers
+            if p.get("year")
+        }
+    )
+    river = []
+    for year in all_years:
+        total = max(1, year_totals.get(year, 0))
+        for sub in all_subfields:
+            count = by_year_subfield[year].get(sub, 0)
+            if count <= 0:
+                continue
+            river.append(
+                {
+                    "year": year,
+                    "sub_field": sub,
+                    "count": count,
+                    "ratio": round(count / total, 4),
+                }
+            )
+
+    return {
+        "trends": trends,
+        "hotspots": hotspots,
+        "bursts": bursts[:20],
+        "river": river,
+        "years": all_years,
+        "sub_fields": all_subfields,
+    }
 
 
 def build_progress_snapshot(papers: List[Dict]) -> Dict:

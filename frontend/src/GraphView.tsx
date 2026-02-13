@@ -51,13 +51,20 @@ import {
   fetchExperiments,
   createExperiment,
   deleteExperiment,
+  fetchShortestPath,
+  comparePapers,
+  classifyCitationIntent,
+  chatWithPapers,
+  discoverOpenTags,
   type GraphNode,
   type GraphResponse,
   type Subfield,
   type SyncStatus,
   type PaperNote,
   type ReadingTask,
-  type Experiment
+  type Experiment,
+  type ComparePapersResponse,
+  type ChatWithPapersResponse
 } from "./api";
 
 const { Title, Text, Paragraph } = Typography;
@@ -86,6 +93,10 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
   const [sortBy, setSortBy] = useState<"citation_count" | "year" | "pagerank">("citation_count");
   const [uploadedOnly, setUploadedOnly] = useState(true);
   const [edgeFocus, setEdgeFocus] = useState<"all" | "out" | "in">("all");
+  const [focusMode, setFocusMode] = useState(false);
+  const [edgeIntentFilter, setEdgeIntentFilter] = useState<
+    "all" | "build_on" | "contrast" | "use_as_baseline" | "mention"
+  >("all");
   const [showLabels, setShowLabels] = useState(false);
   const [labelMode, setLabelMode] = useState<"auto" | "selected" | "all">("auto");
   const hoveredNodeIdRef = useRef<string | null>(null);
@@ -100,6 +111,8 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
   const [allSubfields, setAllSubfields] = useState<Subfield[]>([]);
   const [subfieldModalOpen, setSubfieldModalOpen] = useState(false);
   const [newSubfieldName, setNewSubfieldName] = useState("");
+  const [openTagLoading, setOpenTagLoading] = useState(false);
+  const [openTagCandidates, setOpenTagCandidates] = useState<string[]>([]);
   const [syncStatus, setSyncStatus] = useState<SyncStatus>({});
   const [syncLimit, setSyncLimit] = useState(5);
   const [syncBusy, setSyncBusy] = useState(false);
@@ -121,6 +134,22 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
   const [expModel, setExpModel] = useState("");
   const [expMetrics, setExpMetrics] = useState("");
   const [experimentLoading, setExperimentLoading] = useState(false);
+  const [compareQueue, setCompareQueue] = useState<number[]>([]);
+  const [compareData, setCompareData] = useState<ComparePapersResponse | null>(null);
+  const [compareLoading, setCompareLoading] = useState(false);
+  const [pathSourceId, setPathSourceId] = useState<number | undefined>();
+  const [pathTargetId, setPathTargetId] = useState<number | undefined>();
+  const [pathLoading, setPathLoading] = useState(false);
+  const [qaQuery, setQaQuery] = useState("");
+  const [qaMode, setQaMode] = useState<"single" | "compare">("single");
+  const [qaLoading, setQaLoading] = useState(false);
+  const [qaResult, setQaResult] = useState<ChatWithPapersResponse | null>(null);
+  const [menu, setMenu] = useState<{ visible: boolean; x: number; y: number; node: GraphNode | null }>({
+    visible: false,
+    x: 0,
+    y: 0,
+    node: null
+  });
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const timelinePositions = useRef<{ year: number; x: number }[]>([]);
   const dragStartX = useRef<number | null>(null);
@@ -295,6 +324,16 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [subfieldModalOpen]);
 
+  useEffect(() => {
+    const hide = () => setMenu((prev) => ({ ...prev, visible: false }));
+    window.addEventListener("scroll", hide, true);
+    window.addEventListener("resize", hide);
+    return () => {
+      window.removeEventListener("scroll", hide, true);
+      window.removeEventListener("resize", hide);
+    };
+  }, []);
+
   const loadNodeWorkspace = async (paperId: number) => {
     try {
       const [noteData, taskData, experimentData] = await Promise.all([
@@ -318,7 +357,10 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
       return;
     }
     loadNodeWorkspace(selected.id);
-  }, [selected?.id]);
+    if (focusMode) {
+      loadNeighbors();
+    }
+  }, [selected?.id, focusMode]);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -359,6 +401,34 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
               "line-color": "#cbd5f5",
               opacity: (edge: cytoscape.EdgeSingular) =>
                 Math.max(0.2, Math.min(0.95, (edge.data("confidence") ?? 0.7) * 0.95))
+            }
+          },
+          {
+            selector: "edge.intent-build_on",
+            style: {
+              "line-color": "#16a34a",
+              "target-arrow-color": "#16a34a"
+            }
+          },
+          {
+            selector: "edge.intent-contrast",
+            style: {
+              "line-color": "#ef4444",
+              "target-arrow-color": "#ef4444"
+            }
+          },
+          {
+            selector: "edge.intent-use_as_baseline",
+            style: {
+              "line-color": "#f59e0b",
+              "target-arrow-color": "#f59e0b"
+            }
+          },
+          {
+            selector: "edge.intent-mention",
+            style: {
+              "line-color": "#94a3b8",
+              "target-arrow-color": "#94a3b8"
             }
           },
           {
@@ -433,8 +503,21 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
         const data = evt.target.data();
         setSelected(data.full);
         setZoteroKey(data.full?.zotero_item_key || "");
+        setMenu((prev) => ({ ...prev, visible: false }));
         hoveredNodeIdRef.current = evt.target.id();
         updateNodeLabels();
+      });
+      cyRef.current.on("cxttap", "node", (evt: cytoscape.EventObject) => {
+        const data = evt.target.data();
+        setSelected(data.full);
+        setZoteroKey(data.full?.zotero_item_key || "");
+        const original = evt.originalEvent as MouseEvent | undefined;
+        setMenu({
+          visible: true,
+          x: original?.clientX ?? 0,
+          y: original?.clientY ?? 0,
+          node: data.full ?? null
+        });
       });
       cyRef.current.on("mouseover", "node", (evt: cytoscape.EventObject) => {
         hoveredNodeIdRef.current = evt.target.id();
@@ -447,6 +530,9 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
       cyRef.current.on("zoom", () => {
         updateNodeLabels();
       });
+      cyRef.current.on("tap", () => {
+        setMenu((prev) => ({ ...prev, visible: false }));
+      });
     }
   }, []);
 
@@ -455,7 +541,27 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     if (!cy) return;
     cy.nodes().removeClass("focus-dim focus-node");
     cy.edges().removeClass("focus-dim focus-edge");
-    if (!selected || edgeFocus === "all") return;
+    if (edgeIntentFilter !== "all") {
+      cy.edges().forEach((edge) => {
+        const intent = edge.data("intent");
+        if (intent !== edgeIntentFilter) {
+          edge.addClass("focus-dim");
+        }
+      });
+    }
+    if (!selected || edgeFocus === "all") {
+      if (focusMode && selected) {
+        const nodeId = selected.id.toString();
+        const node = cy.$id(nodeId);
+        cy.nodes().addClass("focus-dim");
+        cy.edges().addClass("focus-dim");
+        node.removeClass("focus-dim").addClass("focus-node");
+        const neighbors = node.neighborhood();
+        neighbors.removeClass("focus-dim").addClass("focus-edge");
+        neighbors.nodes().removeClass("focus-dim");
+      }
+      return;
+    }
     const nodeId = selected.id.toString();
     cy.nodes().addClass("focus-dim");
     cy.edges().addClass("focus-dim");
@@ -463,10 +569,14 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     node.removeClass("focus-dim").addClass("focus-node");
     const selector = edgeFocus === "out" ? `[source = \"${nodeId}\"]` : `[target = \"${nodeId}\"]`;
     const edges = cy.edges(selector);
-    edges.removeClass("focus-dim").addClass("focus-edge");
-    edges.sources().removeClass("focus-dim");
-    edges.targets().removeClass("focus-dim");
-  }, [edgeFocus, selected, graph]);
+    const filteredEdges =
+      edgeIntentFilter === "all"
+        ? edges
+        : edges.filter((edge) => edge.data("intent") === edgeIntentFilter);
+    filteredEdges.removeClass("focus-dim").addClass("focus-edge");
+    filteredEdges.sources().removeClass("focus-dim");
+    filteredEdges.targets().removeClass("focus-dim");
+  }, [edgeFocus, edgeIntentFilter, focusMode, selected, graph]);
 
   useEffect(() => {
     fetchData(subField, yearRange);
@@ -503,11 +613,19 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
           source: edge.source.toString(),
           target: edge.target.toString(),
           confidence: edge.confidence ?? 0.75,
-          edge_source: edge.edge_source ?? null
+          edge_source: edge.edge_source ?? null,
+          intent: edge.intent ?? null,
+          intent_confidence: edge.intent_confidence ?? null
         }
       });
     });
     cy.add(elements);
+    cy.edges().forEach((edge) => {
+      const intent = edge.data("intent");
+      if (intent) {
+        edge.addClass(`intent-${intent}`);
+      }
+    });
     updateNodeLabels();
     applyLayout(layout);
     clearPathAnimation();
@@ -712,7 +830,9 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
           cy.add({
             data: {
               id: node.id.toString(),
-              label: node.label,
+              label: shortLabel(node.label),
+              displayLabel: "",
+              fullLabel: shortLabel(node.label),
               size: node.size ?? 24,
               color: node.color,
               full: node
@@ -728,9 +848,14 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
               source: edge.source.toString(),
               target: edge.target.toString(),
               confidence: edge.confidence ?? 0.75,
-              edge_source: edge.edge_source ?? null
+              edge_source: edge.edge_source ?? null,
+              intent: edge.intent ?? null,
+              intent_confidence: edge.intent_confidence ?? null
             }
           });
+          if (edge.intent) {
+            cy.$id(edge.id).addClass(`intent-${edge.intent}`);
+          }
         }
       });
       applyLayout(layout);
@@ -820,6 +945,11 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     setPendingRange(null);
   };
 
+  useEffect(() => {
+    runComparison();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [compareQueue.join(",")]);
+
   const maybeAutoPush = async (paperId: number, zoteroKey?: string | null) => {
     if (!autoPush || !zoteroKey) return;
     try {
@@ -827,6 +957,105 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
       message.success(t("zotero.auto_push_ok"));
     } catch {
       message.error(t("zotero.auto_push_fail"));
+    }
+  };
+
+  const addToComparison = (paperId: number) => {
+    setCompareQueue((prev) => {
+      if (prev.includes(paperId)) return prev;
+      return [...prev, paperId].slice(-8);
+    });
+  };
+
+  const removeFromComparison = (paperId: number) => {
+    setCompareQueue((prev) => prev.filter((id) => id !== paperId));
+  };
+
+  const runComparison = async () => {
+    if (compareQueue.length === 0) {
+      setCompareData(null);
+      return;
+    }
+    setCompareLoading(true);
+    try {
+      const data = await comparePapers({ paper_ids: compareQueue });
+      setCompareData(data);
+    } finally {
+      setCompareLoading(false);
+    }
+  };
+
+  const classifyIntents = async () => {
+    const cy = cyRef.current;
+    const edges = cy?.edges().map((edge) => edge.id()) ?? [];
+    if (!edges.length) {
+      message.warning(t("details.select_hint"));
+      return;
+    }
+    const res = await classifyCitationIntent({ edge_ids: edges, limit: 200 });
+    message.success(`${t("sync.processed")} ${res.updated}`);
+    await fetchData(subField, yearRange);
+  };
+
+  const highlightShortestPath = async () => {
+    if (!pathSourceId || !pathTargetId || !cyRef.current) {
+      message.warning(t("graph.path_missing"));
+      return;
+    }
+    setPathLoading(true);
+    try {
+      const data = await fetchShortestPath({
+        source_id: pathSourceId,
+        target_id: pathTargetId,
+        direction: edgeFocus === "all" ? "any" : edgeFocus
+      });
+      const cy = cyRef.current;
+      if (!cy) return;
+      cy.nodes().removeClass("path-step");
+      cy.edges().removeClass("path-edge");
+      if (!data.path.nodes.length) {
+        message.warning(t("graph.path_not_found"));
+        return;
+      }
+      data.path.nodes.forEach((id) => cy.$id(String(id)).addClass("path-step"));
+      data.path.edges.forEach(([source, target]) => {
+        const forward = cy.edges(`[source = \"${source}\"][target = \"${target}\"]`);
+        if (forward.nonempty()) {
+          forward.addClass("path-edge");
+          return;
+        }
+        cy.edges(`[source = \"${target}\"][target = \"${source}\"]`).addClass("path-edge");
+      });
+      message.success(`${t("graph.path_len")}: ${data.path.distance ?? 0}`);
+    } finally {
+      setPathLoading(false);
+    }
+  };
+
+  const askPaperQa = async () => {
+    const query = qaQuery.trim();
+    if (!query) return;
+    const paperIds =
+      qaMode === "single"
+        ? selected
+          ? [selected.id]
+          : []
+        : compareQueue;
+    if (!paperIds.length) {
+      message.warning(t("qa.select_papers"));
+      return;
+    }
+    setQaLoading(true);
+    try {
+      const result = await chatWithPapers({
+        query,
+        paper_ids: paperIds,
+        top_k: 8,
+        language: navigator.language?.toLowerCase().startsWith("zh") ? "zh" : "en"
+      });
+      setQaResult(result);
+    } finally {
+      setQaLoading(false);
     }
   };
 
@@ -1396,6 +1625,25 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
               {edgeFocus !== "all" && (
                 <Button onClick={() => setEdgeFocus("all")}>{t("details.show_all")}</Button>
               )}
+              <Switch checked={focusMode} onChange={setFocusMode} />
+              <Text type="secondary">{t("graph.focus")}</Text>
+              <Select
+                value={edgeIntentFilter}
+                style={{ width: 170 }}
+                onChange={(value) =>
+                  setEdgeIntentFilter(
+                    value as "all" | "build_on" | "contrast" | "use_as_baseline" | "mention"
+                  )
+                }
+                options={[
+                  { label: t("graph.intent_all"), value: "all" },
+                  { label: t("graph.intent_build_on"), value: "build_on" },
+                  { label: t("graph.intent_contrast"), value: "contrast" },
+                  { label: t("graph.intent_baseline"), value: "use_as_baseline" },
+                  { label: t("graph.intent_mention"), value: "mention" }
+                ]}
+              />
+              <Button onClick={classifyIntents}>{t("graph.classify_intent")}</Button>
               <Switch checked={showLabels} onChange={setShowLabels} />
               <Text type="secondary">{t("graph.labels")}</Text>
               <Select
@@ -1411,10 +1659,43 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
               {!selected && <Text type="secondary">{t("graph.relation_hint")}</Text>}
             </Space>
             <Space size="small" wrap>
+              <Select
+                allowClear
+                placeholder={t("graph.path_source")}
+                style={{ width: 160 }}
+                value={pathSourceId}
+                onChange={(value) => setPathSourceId(value)}
+                options={(graph?.nodes || []).map((n) => ({ label: shortLabel(n.label), value: n.id }))}
+              />
+              <Select
+                allowClear
+                placeholder={t("graph.path_target")}
+                style={{ width: 160 }}
+                value={pathTargetId}
+                onChange={(value) => setPathTargetId(value)}
+                options={(graph?.nodes || []).map((n) => ({ label: shortLabel(n.label), value: n.id }))}
+              />
+              <Button loading={pathLoading} onClick={highlightShortestPath}>
+                {t("graph.shortest_path")}
+              </Button>
+              <Button
+                onClick={() => {
+                  if (!cyRef.current) return;
+                  cyRef.current.nodes().removeClass("path-step");
+                  cyRef.current.edges().removeClass("path-edge");
+                }}
+              >
+                {t("graph.clear_shortest_path")}
+              </Button>
+            </Space>
+            <Space size="small" wrap>
               <Tag color="red">{t("legend.ccf")}</Tag>
               <Tag color="blue">{t("legend.global")}</Tag>
               <Tag color="green">{t("legend.cnki")}</Tag>
               <Tag color="default">{t("legend.ref_only")}</Tag>
+              <Tag color="green">{t("graph.intent_build_on")}</Tag>
+              <Tag color="red">{t("graph.intent_contrast")}</Tag>
+              <Tag color="gold">{t("graph.intent_baseline")}</Tag>
               <Tag color="blue">
                 {t("sync.queued")} {syncStatus.queued ?? 0}
               </Tag>
@@ -1517,6 +1798,16 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
                   </Paragraph>
                 </div>
               )}
+              {selected.proposed_method_name && (
+                <Tag color="cyan">{selected.proposed_method_name}</Tag>
+              )}
+              {selected.dynamic_tags && selected.dynamic_tags.length > 0 && (
+                <Space size="small" wrap>
+                  {selected.dynamic_tags.map((tag) => (
+                    <Tag key={`${selected.id}-${tag}`}>{tag}</Tag>
+                  ))}
+                </Space>
+              )}
               <Space size="small">
                 {selected.citation_count !== null && (
                   <Tag color="gold">
@@ -1551,6 +1842,21 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
                 }}
               >
                 {selected.read_status === 1 ? t("details.mark_unread") : t("details.mark_read")}
+              </Button>
+              <Button onClick={() => addToComparison(selected.id)}>{t("compare.add")}</Button>
+              <Button
+                onClick={() => {
+                  setPathSourceId(selected.id);
+                }}
+              >
+                {t("compare.set_source")}
+              </Button>
+              <Button
+                onClick={() => {
+                  setPathTargetId(selected.id);
+                }}
+              >
+                {t("compare.set_target")}
               </Button>
               <div>
                 <Text type="secondary">{t("details.zotero_key")}</Text>
@@ -1884,6 +2190,97 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
                         />
                       </Space>
                     )
+                  },
+                  {
+                    key: "comparison",
+                    label: t("compare.title"),
+                    children: (
+                      <Space direction="vertical" size="small" style={{ width: "100%" }}>
+                        <Space size="small" wrap>
+                          {compareQueue.map((paperId) => (
+                            <Tag
+                              key={paperId}
+                              closable
+                              onClose={(e) => {
+                                e.preventDefault();
+                                removeFromComparison(paperId);
+                              }}
+                            >
+                              #{paperId}
+                            </Tag>
+                          ))}
+                        </Space>
+                        <Button onClick={runComparison} loading={compareLoading}>
+                          {t("compare.refresh")}
+                        </Button>
+                        <List
+                          size="small"
+                          loading={compareLoading}
+                          dataSource={compareData?.items || []}
+                          locale={{ emptyText: t("compare.empty") }}
+                          renderItem={(item) => (
+                            <List.Item>
+                              <Space direction="vertical" size={0} style={{ width: "100%" }}>
+                                <Text strong>{item.paper.title || "-"}</Text>
+                                <Text type="secondary">
+                                  {item.metrics
+                                    .slice(0, 2)
+                                    .map((m) => `${m.dataset_name || "-"} F1:${m.f1 ?? m.argument_f1 ?? m.trigger_f1 ?? "-"}`)
+                                    .join(" | ")}
+                                </Text>
+                                <Space size="small" wrap>
+                                  {item.tags.slice(0, 4).map((tag) => (
+                                    <Tag key={`${item.paper.id}-${tag}`}>{tag}</Tag>
+                                  ))}
+                                </Space>
+                              </Space>
+                            </List.Item>
+                          )}
+                        />
+                      </Space>
+                    )
+                  },
+                  {
+                    key: "qa",
+                    label: t("qa.title"),
+                    children: (
+                      <Space direction="vertical" size="small" style={{ width: "100%" }}>
+                        <Select
+                          value={qaMode}
+                          onChange={(value) => setQaMode(value as "single" | "compare")}
+                          options={[
+                            { label: t("qa.single"), value: "single" },
+                            { label: t("qa.multi"), value: "compare" }
+                          ]}
+                        />
+                        <Input.TextArea
+                          value={qaQuery}
+                          onChange={(e) => setQaQuery(e.target.value)}
+                          placeholder={t("qa.placeholder")}
+                          autoSize={{ minRows: 2, maxRows: 4 }}
+                        />
+                        <Button type="primary" onClick={askPaperQa} loading={qaLoading}>
+                          {t("qa.ask")}
+                        </Button>
+                        {qaResult && (
+                          <>
+                            <Paragraph style={{ whiteSpace: "pre-wrap" }}>{qaResult.answer}</Paragraph>
+                            <List
+                              size="small"
+                              header={<Text type="secondary">{t("qa.sources")}</Text>}
+                              dataSource={qaResult.sources}
+                              renderItem={(source) => (
+                                <List.Item>
+                                  <Text type="secondary">
+                                    #{source.paper_id} {source.title} {source.chunk_index !== undefined ? ` [chunk ${source.chunk_index}]` : ""}
+                                  </Text>
+                                </List.Item>
+                              )}
+                            />
+                          </>
+                        )}
+                      </Space>
+                    )
                   }
                 ]}
               />
@@ -1893,6 +2290,44 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
           )}
         </Card>
       </div>
+      {menu.visible && menu.node && (
+        <div
+          className="graph-context-menu"
+          style={{ left: menu.x, top: menu.y }}
+          onMouseLeave={() => setMenu((prev) => ({ ...prev, visible: false }))}
+        >
+          <Button
+            type="text"
+            block
+            onClick={() => {
+              addToComparison(menu.node!.id);
+              setMenu((prev) => ({ ...prev, visible: false }));
+            }}
+          >
+            {t("compare.add")}
+          </Button>
+          <Button
+            type="text"
+            block
+            onClick={() => {
+              setPathSourceId(menu.node!.id);
+              setMenu((prev) => ({ ...prev, visible: false }));
+            }}
+          >
+            {t("compare.set_source")}
+          </Button>
+          <Button
+            type="text"
+            block
+            onClick={() => {
+              setPathTargetId(menu.node!.id);
+              setMenu((prev) => ({ ...prev, visible: false }));
+            }}
+          >
+            {t("compare.set_target")}
+          </Button>
+        </div>
+      )}
       <Drawer
         title={t("graph.panel")}
         placement="left"
@@ -1939,6 +2374,47 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
               {t("manage.add")}
             </Button>
           </Space.Compact>
+          <Space size="small" wrap>
+            <Button
+              loading={openTagLoading}
+              onClick={async () => {
+                setOpenTagLoading(true);
+                try {
+                  const result = await discoverOpenTags({ limit: 300, add_to_subfields: false });
+                  setOpenTagCandidates(result.candidates);
+                  message.success(`${t("manage.discover_ok")}: ${result.candidates.length}`);
+                } finally {
+                  setOpenTagLoading(false);
+                }
+              }}
+            >
+              {t("manage.discover_tags")}
+            </Button>
+            <Button
+              loading={openTagLoading}
+              onClick={async () => {
+                setOpenTagLoading(true);
+                try {
+                  const result = await discoverOpenTags({ limit: 300, add_to_subfields: true });
+                  message.success(`${t("manage.added_ok")}: ${result.added}`);
+                  setOpenTagCandidates(result.candidates);
+                  await loadSubfields(true);
+                  await loadSubfields(false);
+                } finally {
+                  setOpenTagLoading(false);
+                }
+              }}
+            >
+              {t("manage.add_discovered")}
+            </Button>
+          </Space>
+          {openTagCandidates.length > 0 && (
+            <Space size="small" wrap>
+              {openTagCandidates.slice(0, 20).map((tag) => (
+                <Tag key={tag}>{tag}</Tag>
+              ))}
+            </Space>
+          )}
           <List
             dataSource={allSubfields}
             renderItem={(item) => (
