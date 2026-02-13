@@ -30,3 +30,5 @@ backend/storage
 *.njsproj
 *.sln
 *.sw?
+__pycache__/
+*.pyc
