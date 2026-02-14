@@ -696,6 +696,7 @@ function AppShell() {
   const [lang, setLang] = useState<Lang>("zh");
   const t = useMemo(() => createT(lang), [lang]);
   const location = useLocation();
+  const isGraphPage = location.pathname === "/graph";
 
   const loadPapers = async () => {
     setLoading(true);
@@ -739,34 +740,34 @@ function AppShell() {
 
   return (
     <ConfigProvider locale={lang === "zh" ? zhCN : enUS}>
-      <Layout className="app-shell">
-        <Header className="app-header">
-          <div className="app-header-inner">
-            <div className="app-brand">
-              <span className="app-kicker">{t("app.kicker")}</span>
-              <Typography.Title level={2} className="app-title">
-                {t("app.title")}
-              </Typography.Title>
-              <Typography.Text className="app-subtitle">{t("app.subtitle")}</Typography.Text>
-              <div className="app-pills">
-                <NavLink className={({ isActive }) => `app-pill nav-pill ${isActive ? "is-active" : ""}`} to="/">
-                  {t("nav.home")}
-                </NavLink>
-                <NavLink className={({ isActive }) => `app-pill nav-pill ${isActive ? "is-active" : ""}`} to="/graph">
-                  {t("nav.graph")}
-                </NavLink>
+      <Layout className={`app-shell ${isGraphPage ? "is-graph-shell" : ""}`}>
+        {!isGraphPage && (
+          <Header className="app-header">
+            <div className="app-header-inner">
+              <div className="app-brand">
+                <span className="app-kicker">{t("app.kicker")}</span>
+                <Typography.Title level={2} className="app-title">
+                  {t("app.title")}
+                </Typography.Title>
+                <Typography.Text className="app-subtitle">{t("app.subtitle")}</Typography.Text>
+                <div className="app-pills">
+                  <NavLink className={({ isActive }) => `app-pill nav-pill ${isActive ? "is-active" : ""}`} to="/">
+                    {t("nav.home")}
+                  </NavLink>
+                  <NavLink className={({ isActive }) => `app-pill nav-pill ${isActive ? "is-active" : ""}`} to="/graph">
+                    {t("nav.graph")}
+                  </NavLink>
+                </div>
               </div>
-            </div>
-            <div className="app-actions">
-              <div className="lang-toggle">
-                <button className={`lang-btn ${lang === "zh" ? "is-active" : ""}`} onClick={() => setLang("zh")}>
-                  中文
-                </button>
-                <button className={`lang-btn ${lang === "en" ? "is-active" : ""}`} onClick={() => setLang("en")}>
-                  EN
-                </button>
-              </div>
-              {location.pathname !== "/graph" && (
+              <div className="app-actions">
+                <div className="lang-toggle">
+                  <button className={`lang-btn ${lang === "zh" ? "is-active" : ""}`} onClick={() => setLang("zh")}>
+                    中文
+                  </button>
+                  <button className={`lang-btn ${lang === "en" ? "is-active" : ""}`} onClick={() => setLang("en")}>
+                    EN
+                  </button>
+                </div>
                 <div className="app-stats">
                   <div className="stat">
                     <span className="stat-label">{t("stats.total")}</span>
@@ -781,11 +782,14 @@ function AppShell() {
                     <span className="stat-value">{stats.unread}</span>
                   </div>
                 </div>
-              )}
+              </div>
             </div>
-          </div>
-        </Header>
-        <Content className={`app-content ${location.pathname === "/graph" ? "is-graph-page" : ""}`}>
+          </Header>
+        )}
+        <Content
+          className={`app-content ${isGraphPage ? "is-graph-page" : ""}`}
+          style={isGraphPage ? { padding: 0, margin: 0, height: "100vh" } : undefined}
+        >
           <Routes>
             <Route
               path="/"

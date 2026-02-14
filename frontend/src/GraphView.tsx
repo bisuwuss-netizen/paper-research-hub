@@ -126,7 +126,6 @@ type ClusterHullShape = {
   label: string;
   fill: string;
   stroke: string;
-  fillOpacity: number;
   path: string;
   labelX: number;
   labelY: number;
@@ -361,12 +360,12 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
   };
 
   const communityPalette = [
-    { fill: "rgba(99, 102, 241, 0.018)", stroke: "rgba(79, 70, 229, 0.28)" },
-    { fill: "rgba(20, 184, 166, 0.016)", stroke: "rgba(15, 118, 110, 0.28)" },
-    { fill: "rgba(245, 158, 11, 0.016)", stroke: "rgba(180, 83, 9, 0.28)" },
-    { fill: "rgba(239, 68, 68, 0.016)", stroke: "rgba(185, 28, 28, 0.28)" },
-    { fill: "rgba(168, 85, 247, 0.018)", stroke: "rgba(126, 34, 206, 0.28)" },
-    { fill: "rgba(14, 165, 233, 0.016)", stroke: "rgba(3, 105, 161, 0.28)" }
+    { fill: "rgba(99, 102, 241, 0.008)", stroke: "rgba(99, 102, 241, 0.15)" },
+    { fill: "rgba(20, 184, 166, 0.008)", stroke: "rgba(20, 184, 166, 0.15)" },
+    { fill: "rgba(245, 158, 11, 0.008)", stroke: "rgba(245, 158, 11, 0.15)" },
+    { fill: "rgba(239, 68, 68, 0.008)", stroke: "rgba(239, 68, 68, 0.15)" },
+    { fill: "rgba(168, 85, 247, 0.008)", stroke: "rgba(168, 85, 247, 0.15)" },
+    { fill: "rgba(14, 165, 233, 0.008)", stroke: "rgba(14, 165, 233, 0.15)" }
   ];
 
   const timelinePadding = {
@@ -374,17 +373,6 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     right: 84,
     top: 150,
     bottom: 118
-  };
-
-  const withAlpha = (value: string, alpha: number) => {
-    const match = value.match(/^rgba?\(([^)]+)\)$/i);
-    if (!match) return value;
-    const parts = match[1]
-      .split(",")
-      .map((part) => part.trim())
-      .slice(0, 3);
-    if (parts.length !== 3) return value;
-    return `rgba(${parts[0]}, ${parts[1]}, ${parts[2]}, ${alpha})`;
   };
 
   const convexHull = (points: Array<{ x: number; y: number }>) => {
@@ -599,14 +587,11 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
       });
       if (count < 2 || points.length < 2) return;
       const meta = communityMetaRef.current[clusterId];
-      const fillOpacity = count >= 24 ? 0.32 : count >= 12 ? 0.42 : 0.56;
-      const fillBase = meta?.color || "rgba(99, 102, 241, 0.016)";
       hulls.push({
         id: clusterId,
         label: meta?.label || `${t("graph.community")} ${clusterId}`,
-        fill: withAlpha(fillBase, Math.max(0.006, 0.02 - count * 0.00025)),
-        stroke: meta?.stroke || "rgba(79,70,229,0.28)",
-        fillOpacity,
+        fill: meta?.color || "rgba(99, 102, 241, 0.008)",
+        stroke: meta?.stroke || "rgba(99, 102, 241, 0.15)",
         path: pathFromPoints(points),
         labelX: centerX / count,
         labelY: centerY / count,
@@ -838,14 +823,18 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
         name: "cose",
         animate: true,
         fit: true,
-        padding: 132,
-        randomize: true,
-        nodeRepulsion: () => 21000,
-        idealEdgeLength: () => 195,
-        edgeElasticity: () => 80,
-        gravity: 0.08,
-        numIter: 1800
-      }).run();
+        padding: 100,
+        randomize: false,
+        nodeRepulsion: () => 450000,
+        idealEdgeLength: () => 280,
+        edgeElasticity: () => 32,
+        gravity: 0.1,
+        numIter: 2500,
+        nestingFactor: 0.1,
+        gravityRangeCompound: 1.5,
+        gravityCompound: 1.0,
+        gravityRange: 3.8
+      } as any).run();
       return;
     }
     if (layoutType === "hierarchy") {
@@ -1139,33 +1128,34 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
               "background-color": "data(color)",
               label: "data(displayLabel)",
               color: "#0f172a",
-              "font-size": 5,
+              "font-size": 10,
               "text-wrap": "wrap",
-              "text-max-width": "66",
+              "text-max-width": "120",
               "min-zoomed-font-size": 5,
               width: "data(size)",
               height: "data(size)",
-              "text-valign": "top",
+              "text-valign": "center",
               "text-halign": "center",
-              "text-margin-y": -5,
+              "text-margin-y": 0,
               "text-background-color": "#ffffff",
               "text-background-opacity": (node: cytoscape.NodeSingular) =>
                 Number(node.data("labelBgOpacity") ?? 0),
               "text-background-padding": "1.2",
-              "text-opacity": (node: cytoscape.NodeSingular) => Number(node.data("labelOpacity") ?? 0)
+              "text-opacity": (node: cytoscape.NodeSingular) => Number(node.data("labelOpacity") ?? 0),
+              "background-opacity": 0.9,
+              "border-width": 1,
+              "border-color": "rgba(255,255,255,0.8)"
             }
           },
           {
             selector: "edge",
             style: {
-              width: (edge: cytoscape.EdgeSingular) =>
-                0.6 + (edge.data("confidence") ?? 0.7) * 2.2,
+              width: 1,
               "curve-style": "bezier",
               "target-arrow-shape": "triangle",
               "target-arrow-color": "#94a3b8",
-              "line-color": "#cbd5f5",
-              opacity: (edge: cytoscape.EdgeSingular) =>
-                Math.max(0.2, Math.min(0.95, (edge.data("confidence") ?? 0.7) * 0.95))
+              "line-color": "#cbd5e1",
+              opacity: 0.4
             }
           },
           {
@@ -3005,7 +2995,6 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
                   <path
                     d={cluster.path}
                     fill={cluster.fill}
-                    fillOpacity={cluster.fillOpacity}
                     stroke={cluster.stroke}
                     strokeWidth={1.2}
                     className="graph-cluster-hull-path"
