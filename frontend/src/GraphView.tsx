@@ -132,6 +132,17 @@ type ClusterHullShape = {
   size: number;
 };
 
+type EdgeBundlePath = {
+  id: string;
+  path: string;
+  stroke: string;
+  width: number;
+  opacity: number;
+  count: number;
+  labelX: number;
+  labelY: number;
+};
+
 export default function GraphView({ t, standalone = false }: GraphViewProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const cyRef = useRef<cytoscape.Core | null>(null);
@@ -186,6 +197,8 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
   const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
   const [readingMode, setReadingMode] = useState(false);
   const [showClusterHull, setShowClusterHull] = useState(true);
+  const [edgeBundling, setEdgeBundling] = useState(true);
+  const [bundledPaths, setBundledPaths] = useState<EdgeBundlePath[]>([]);
   const [clusterHulls, setClusterHulls] = useState<ClusterHullShape[]>([]);
   const [communityCount, setCommunityCount] = useState(0);
   const [timelineGuides, setTimelineGuides] = useState<Array<{ year: number; x: number }>>([]);
@@ -291,6 +304,7 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
   const communityByNodeRef = useRef<Record<string, string>>({});
   const communityMetaRef = useRef<Record<string, { label: string; color: string; stroke: string; size: number }>>({});
   const hullRafRef = useRef<number | null>(null);
+  const bundleRafRef = useRef<number | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [dragRange, setDragRange] = useState<[number, number] | null>(null);
   const [pendingRange, setPendingRange] = useState<[number, number] | null>(null);
@@ -507,13 +521,7 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
       setTimelineGuides([]);
       return;
     }
-    const container = containerRef.current;
-    if (container) {
-      setCanvasSize({
-        width: container.clientWidth || 800,
-        height: container.clientHeight || 600
-      });
-    }
+    syncCanvasSize();
     if (layout === "timeline") {
       const yearMap = new Map<number, number[]>();
       cy.nodes().forEach((node) => {
@@ -586,6 +594,120 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     hullRafRef.current = window.requestAnimationFrame(() => {
       hullRafRef.current = null;
       refreshClusterHulls();
+    });
+  };
+
+  const syncCanvasSize = () => {
+    const container = containerRef.current;
+    const width = container?.clientWidth || 800;
+    const height = container?.clientHeight || 600;
+    setCanvasSize((prev) => (prev.width === width && prev.height === height ? prev : { width, height }));
+  };
+
+  const hashSign = (value: string) => {
+    let sum = 0;
+    for (let idx = 0; idx < value.length; idx += 1) {
+      sum = (sum + value.charCodeAt(idx) * (idx + 1)) % 9973;
+    }
+    return sum % 2 === 0 ? 1 : -1;
+  };
+
+  const refreshEdgeBundles = () => {
+    const cy = cyRef.current;
+    if (!cy) {
+      setBundledPaths([]);
+      return;
+    }
+    syncCanvasSize();
+
+    cy.edges().removeClass("bundled-edge");
+    if (!edgeBundling) {
+      setBundledPaths([]);
+      return;
+    }
+
+    const visibleEdges = cy
+      .edges()
+      .filter((edge) => !edge.hasClass("focus-dim") && !edge.hasClass("declutter-edge"));
+    if (visibleEdges.length < 40) {
+      setBundledPaths([]);
+      return;
+    }
+
+    const grouped = new Map<
+      string,
+      Array<{
+        source: { x: number; y: number };
+        target: { x: number; y: number };
+      }>
+    >();
+    visibleEdges.forEach((edge) => {
+      const sourceId = edge.source().id();
+      const targetId = edge.target().id();
+      const sourceCluster = communityByNodeRef.current[sourceId] || sourceId;
+      const targetCluster = communityByNodeRef.current[targetId] || targetId;
+      const key = `${sourceCluster}->${targetCluster}`;
+      if (!grouped.has(key)) grouped.set(key, []);
+      grouped.get(key)?.push({
+        source: edge.source().renderedPosition(),
+        target: edge.target().renderedPosition()
+      });
+    });
+
+    const bundles: EdgeBundlePath[] = [];
+    grouped.forEach((links, key) => {
+      if (links.length < 3) return;
+      const sourceCenter = links.reduce(
+        (acc, item) => ({ x: acc.x + item.source.x, y: acc.y + item.source.y }),
+        { x: 0, y: 0 }
+      );
+      sourceCenter.x /= links.length;
+      sourceCenter.y /= links.length;
+
+      const targetCenter = links.reduce(
+        (acc, item) => ({ x: acc.x + item.target.x, y: acc.y + item.target.y }),
+        { x: 0, y: 0 }
+      );
+      targetCenter.x /= links.length;
+      targetCenter.y /= links.length;
+
+      const dx = targetCenter.x - sourceCenter.x;
+      const dy = targetCenter.y - sourceCenter.y;
+      const distance = Math.hypot(dx, dy) || 1;
+      const nx = -dy / distance;
+      const ny = dx / distance;
+      const offset = Math.min(120, 20 + Math.log(links.length + 1) * 24);
+      const sign = hashSign(key);
+      const cx = (sourceCenter.x + targetCenter.x) / 2 + nx * offset * sign;
+      const cyMid = (sourceCenter.y + targetCenter.y) / 2 + ny * offset * sign;
+      const sourceCluster = key.split("->")[0] || "";
+      const bundleStroke = communityMetaRef.current[sourceCluster]?.stroke || "rgba(79,70,229,0.34)";
+      bundles.push({
+        id: key,
+        path: `M ${sourceCenter.x} ${sourceCenter.y} Q ${cx} ${cyMid} ${targetCenter.x} ${targetCenter.y}`,
+        stroke: bundleStroke,
+        width: Math.max(1.4, Math.min(7, 1 + Math.log(links.length + 1) * 1.35)),
+        opacity: Math.min(0.42, 0.1 + Math.log(links.length + 1) * 0.09),
+        count: links.length,
+        labelX: cx,
+        labelY: cyMid
+      });
+    });
+
+    if (!bundles.length) {
+      setBundledPaths([]);
+      return;
+    }
+
+    visibleEdges.addClass("bundled-edge");
+    setBundledPaths(bundles.sort((a, b) => b.count - a.count));
+  };
+
+  const scheduleBundleRefresh = () => {
+    if (bundleRafRef.current !== null) return;
+    bundleRafRef.current = window.requestAnimationFrame(() => {
+      bundleRafRef.current = null;
+      refreshEdgeBundles();
     });
   };
 
@@ -798,7 +920,10 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
 
   useEffect(() => {
     const hide = () => setMenu((prev) => ({ ...prev, visible: false }));
-    const onResize = () => scheduleHullRefresh();
+    const onResize = () => {
+      scheduleHullRefresh();
+      scheduleBundleRefresh();
+    };
     window.addEventListener("scroll", hide, true);
     window.addEventListener("resize", hide);
     window.addEventListener("resize", onResize);
@@ -812,19 +937,25 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
   useEffect(() => {
     const cy = cyRef.current;
     if (!cy) return;
-    const update = () => scheduleHullRefresh();
+    const update = () => {
+      scheduleHullRefresh();
+      scheduleBundleRefresh();
+    };
     cy.on("zoom pan layoutstop dragfree add remove", update);
     update();
     return () => {
       cy.off("zoom pan layoutstop dragfree add remove", update);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showClusterHull, graph]);
+  }, [showClusterHull, edgeBundling, graph, layout, edgeFocus]);
 
   useEffect(() => {
     return () => {
       if (hullRafRef.current !== null) {
         window.cancelAnimationFrame(hullRafRef.current);
+      }
+      if (bundleRafRef.current !== null) {
+        window.cancelAnimationFrame(bundleRafRef.current);
       }
     };
   }, []);
@@ -916,6 +1047,15 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
               "line-color": "#cbd5f5",
               opacity: (edge: cytoscape.EdgeSingular) =>
                 Math.max(0.2, Math.min(0.95, (edge.data("confidence") ?? 0.7) * 0.95))
+            }
+          },
+          {
+            selector: "edge.bundled-edge",
+            style: {
+              width: 0.35,
+              opacity: 0.03,
+              "line-color": "#cbd5e1",
+              "target-arrow-shape": "none"
             }
           },
           {
@@ -1059,6 +1199,7 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
       cyRef.current.on("zoom", () => {
         updateNodeLabels();
         applySemanticDeclutter();
+        scheduleBundleRefresh();
       });
       cyRef.current.on("tap", () => {
         setMenu((prev) => ({ ...prev, visible: false }));
@@ -1172,12 +1313,14 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     applyLayout(layout);
     applySemanticDeclutter();
     scheduleHullRefresh();
+    scheduleBundleRefresh();
     clearPathAnimation();
   }, [graph, showLabels, smartDeclutter, layout]);
 
   useEffect(() => {
     applyLayout(layout);
     scheduleHullRefresh();
+    scheduleBundleRefresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [layout]);
 
@@ -1350,7 +1493,10 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     if (!cy) return;
     cy.edges().removeClass("declutter-edge");
     cy.nodes().removeClass("declutter-node");
-    if (!smartDeclutter) return;
+    if (!smartDeclutter) {
+      scheduleBundleRefresh();
+      return;
+    }
 
     const zoom = cy.zoom();
     const selectedId = selected ? selected.id.toString() : null;
@@ -1372,6 +1518,7 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
         }
       });
     }
+    scheduleBundleRefresh();
   };
 
   useEffect(() => {
@@ -1450,6 +1597,7 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
       applyLayout(layout);
       applySemanticDeclutter();
       scheduleHullRefresh();
+      scheduleBundleRefresh();
     } catch {
       message.error(t("msg.neighbors_failed"));
     }
@@ -2527,6 +2675,10 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
         <Switch checked={showClusterHull} onChange={setShowClusterHull} />
       </div>
       <div className="graph-advanced-row">
+        <Text type="secondary">{t("graph.edge_bundling")}</Text>
+        <Switch checked={edgeBundling} onChange={setEdgeBundling} />
+      </div>
+      <div className="graph-advanced-row">
         <Text type="secondary">{t("graph.labels")}</Text>
         <Switch checked={showLabels} onChange={setShowLabels} />
       </div>
@@ -2696,6 +2848,31 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
                 </div>
               ))}
             </div>
+          )}
+          {edgeBundling && bundledPaths.length > 0 && (
+            <svg
+              className="graph-edge-bundles"
+              viewBox={`0 0 ${canvasSize.width} ${canvasSize.height}`}
+              preserveAspectRatio="none"
+            >
+              {bundledPaths.map((bundle) => (
+                <g key={bundle.id}>
+                  <path
+                    d={bundle.path}
+                    fill="none"
+                    stroke={bundle.stroke}
+                    strokeWidth={bundle.width}
+                    opacity={bundle.opacity}
+                    className="graph-edge-bundle-path"
+                  />
+                  {bundle.count >= 8 && (
+                    <text x={bundle.labelX} y={bundle.labelY} className="graph-edge-bundle-label">
+                      {bundle.count}
+                    </text>
+                  )}
+                </g>
+              ))}
+            </svg>
           )}
           {showClusterHull && clusterHulls.length > 0 && (
             <svg

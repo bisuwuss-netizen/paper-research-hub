@@ -745,6 +745,32 @@ body {
   z-index: 1;
 }
 
+.graph-edge-bundles {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.graph-edge-bundle-path {
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  mix-blend-mode: multiply;
+}
+
+.graph-edge-bundle-label {
+  font-size: 9px;
+  fill: #475569;
+  text-anchor: middle;
+  paint-order: stroke;
+  stroke: rgba(255, 255, 255, 0.95);
+  stroke-width: 3px;
+  font-weight: 600;
+}
+
 .graph-cluster-hull-path {
   stroke-dasharray: 3 5;
   filter: saturate(90%);
