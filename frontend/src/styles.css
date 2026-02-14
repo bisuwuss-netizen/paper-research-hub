@@ -348,7 +348,7 @@ body {
   left: 24px;
   bottom: 24px;
   height: auto;
-  width: 320px;
+  width: 286px;
   transition: width 0.2s ease;
 }
 
@@ -368,7 +368,7 @@ body {
   right: 24px;
   bottom: 24px;
   height: auto;
-  width: 400px;
+  width: 396px;
 }
 
 .graph-inspector.is-collapsed {
@@ -380,13 +380,19 @@ body {
 }
 
 .graph-sidebar-card {
-  max-height: calc(100vh - 48px);
+  height: 100%;
+  max-height: none;
   overflow: hidden;
   border-radius: 24px;
+  display: flex;
+  flex-direction: column;
 }
 
 .graph-sidebar-card .ant-card-body {
   padding: 10px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
 }
 
 .graph-sidebar-header {
@@ -412,8 +418,9 @@ body {
 }
 
 .graph-sidebar-card .ant-tabs-content-holder {
-  max-height: calc(100vh - 128px);
-  overflow: auto;
+  flex: 1;
+  overflow-y: auto;
+  max-height: none;
   padding-right: 4px;
 }
 
@@ -530,20 +537,27 @@ body {
 }
 
 .graph-inspector .graph-card {
-  max-height: calc(100vh - 48px);
+  height: 100%;
+  max-height: none;
   overflow: hidden;
   border-radius: 24px;
+  display: flex;
+  flex-direction: column;
 }
 
 .graph-inspector .graph-inspector-card .ant-card-body {
-  max-height: calc(100vh - 128px);
+  height: 100%;
+  max-height: none;
   overflow: auto;
   padding-right: 10px;
+  display: flex;
+  flex-direction: column;
 }
 
 .graph-inspector .graph-inspector-card .ant-tabs-content-holder {
-  max-height: calc(100vh - 186px);
-  overflow: auto;
+  flex: 1;
+  overflow-y: auto;
+  max-height: none;
   padding-right: 6px;
 }
 

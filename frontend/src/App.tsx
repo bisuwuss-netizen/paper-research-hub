@@ -788,7 +788,7 @@ function AppShell() {
         )}
         <Content
           className={`app-content ${isGraphPage ? "is-graph-page" : ""}`}
-          style={isGraphPage ? { padding: 0, margin: 0, height: "100vh" } : undefined}
+          style={isGraphPage ? { padding: 0, margin: 0, height: "100vh", overflow: "hidden" } : undefined}
         >
           <Routes>
             <Route

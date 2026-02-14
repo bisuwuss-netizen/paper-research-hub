@@ -360,12 +360,12 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
   };
 
   const communityPalette = [
-    { fill: "rgba(99, 102, 241, 0.008)", stroke: "rgba(99, 102, 241, 0.15)" },
-    { fill: "rgba(20, 184, 166, 0.008)", stroke: "rgba(20, 184, 166, 0.15)" },
-    { fill: "rgba(245, 158, 11, 0.008)", stroke: "rgba(245, 158, 11, 0.15)" },
-    { fill: "rgba(239, 68, 68, 0.008)", stroke: "rgba(239, 68, 68, 0.15)" },
-    { fill: "rgba(168, 85, 247, 0.008)", stroke: "rgba(168, 85, 247, 0.15)" },
-    { fill: "rgba(14, 165, 233, 0.008)", stroke: "rgba(14, 165, 233, 0.15)" }
+    { fill: "rgba(99, 102, 241, 0.005)", stroke: "rgba(79, 70, 229, 0.15)" },
+    { fill: "rgba(20, 184, 166, 0.005)", stroke: "rgba(15, 118, 110, 0.15)" },
+    { fill: "rgba(245, 158, 11, 0.005)", stroke: "rgba(180, 83, 9, 0.15)" },
+    { fill: "rgba(239, 68, 68, 0.005)", stroke: "rgba(185, 28, 28, 0.15)" },
+    { fill: "rgba(168, 85, 247, 0.005)", stroke: "rgba(126, 34, 206, 0.15)" },
+    { fill: "rgba(14, 165, 233, 0.005)", stroke: "rgba(3, 105, 161, 0.15)" }
   ];
 
   const timelinePadding = {
