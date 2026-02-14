@@ -119,6 +119,17 @@ type GraphViewProps = {
   standalone?: boolean;
 };
 
+type ClusterHullShape = {
+  id: string;
+  label: string;
+  fill: string;
+  stroke: string;
+  path: string;
+  labelX: number;
+  labelY: number;
+  size: number;
+};
+
 export default function GraphView({ t, standalone = false }: GraphViewProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const cyRef = useRef<cytoscape.Core | null>(null);
@@ -171,6 +182,11 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
   const [sidebarDrawerOpen, setSidebarDrawerOpen] = useState(false);
   const [inspectorTab, setInspectorTab] = useState<"details" | "chat">("details");
   const [readingMode, setReadingMode] = useState(false);
+  const [showClusterHull, setShowClusterHull] = useState(true);
+  const [clusterHulls, setClusterHulls] = useState<ClusterHullShape[]>([]);
+  const [communityCount, setCommunityCount] = useState(0);
+  const [timelineGuides, setTimelineGuides] = useState<Array<{ year: number; x: number }>>([]);
+  const [canvasSize, setCanvasSize] = useState({ width: 800, height: 600 });
   const [note, setNote] = useState<PaperNote | null>(null);
   const [noteSaving, setNoteSaving] = useState(false);
   const [backlinks, setBacklinks] = useState<BacklinksResponse | null>(null);
@@ -269,6 +285,9 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
   const timelinePositions = useRef<{ year: number; x: number }[]>([]);
   const dragStartX = useRef<number | null>(null);
   const dragAnchorYear = useRef<number | null>(null);
+  const communityByNodeRef = useRef<Record<string, string>>({});
+  const communityMetaRef = useRef<Record<string, { label: string; color: string; stroke: string; size: number }>>({});
+  const hullRafRef = useRef<number | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [dragRange, setDragRange] = useState<[number, number] | null>(null);
   const [pendingRange, setPendingRange] = useState<[number, number] | null>(null);
@@ -323,14 +342,235 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     }
   };
 
+  const communityPalette = [
+    { fill: "rgba(99, 102, 241, 0.12)", stroke: "#4f46e5" },
+    { fill: "rgba(20, 184, 166, 0.12)", stroke: "#0f766e" },
+    { fill: "rgba(245, 158, 11, 0.12)", stroke: "#b45309" },
+    { fill: "rgba(239, 68, 68, 0.11)", stroke: "#b91c1c" },
+    { fill: "rgba(168, 85, 247, 0.12)", stroke: "#7e22ce" },
+    { fill: "rgba(14, 165, 233, 0.12)", stroke: "#0369a1" }
+  ];
+
+  const convexHull = (points: Array<{ x: number; y: number }>) => {
+    if (points.length <= 1) return points;
+    const sorted = points
+      .slice()
+      .sort((a, b) => (a.x === b.x ? a.y - b.y : a.x - b.x));
+    const cross = (
+      o: { x: number; y: number },
+      a: { x: number; y: number },
+      b: { x: number; y: number }
+    ) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+    const lower: Array<{ x: number; y: number }> = [];
+    for (const point of sorted) {
+      while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], point) <= 0) {
+        lower.pop();
+      }
+      lower.push(point);
+    }
+    const upper: Array<{ x: number; y: number }> = [];
+    for (let idx = sorted.length - 1; idx >= 0; idx -= 1) {
+      const point = sorted[idx];
+      while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], point) <= 0) {
+        upper.pop();
+      }
+      upper.push(point);
+    }
+    lower.pop();
+    upper.pop();
+    return lower.concat(upper);
+  };
+
+  const pathFromPoints = (points: Array<{ x: number; y: number }>) => {
+    if (!points.length) return "";
+    const hull = convexHull(points);
+    if (!hull.length) return "";
+    if (hull.length === 1) {
+      const p = hull[0];
+      const r = 30;
+      return `M ${p.x - r} ${p.y} a ${r} ${r} 0 1 0 ${r * 2} 0 a ${r} ${r} 0 1 0 ${-r * 2} 0`;
+    }
+    if (hull.length === 2) {
+      const [a, b] = hull;
+      const minX = Math.min(a.x, b.x) - 22;
+      const minY = Math.min(a.y, b.y) - 22;
+      const maxX = Math.max(a.x, b.x) + 22;
+      const maxY = Math.max(a.y, b.y) + 22;
+      return `M ${minX + 12} ${minY} L ${maxX - 12} ${minY} Q ${maxX} ${minY} ${maxX} ${minY + 12} L ${maxX} ${maxY - 12} Q ${maxX} ${maxY} ${maxX - 12} ${maxY} L ${minX + 12} ${maxY} Q ${minX} ${maxY} ${minX} ${maxY - 12} L ${minX} ${minY + 12} Q ${minX} ${minY} ${minX + 12} ${minY} Z`;
+    }
+    const centroid = hull.reduce(
+      (acc, point) => ({ x: acc.x + point.x, y: acc.y + point.y }),
+      { x: 0, y: 0 }
+    );
+    centroid.x /= hull.length;
+    centroid.y /= hull.length;
+    const expanded = hull.map((point) => {
+      const dx = point.x - centroid.x;
+      const dy = point.y - centroid.y;
+      const len = Math.hypot(dx, dy) || 1;
+      const pad = 16;
+      return { x: point.x + (dx / len) * pad, y: point.y + (dy / len) * pad };
+    });
+    return `M ${expanded.map((point) => `${point.x} ${point.y}`).join(" L ")} Z`;
+  };
+
+  const detectCommunities = () => {
+    const cy = cyRef.current;
+    if (!cy) {
+      communityByNodeRef.current = {};
+      communityMetaRef.current = {};
+      setCommunityCount(0);
+      return;
+    }
+    const nodeIds = cy.nodes().map((node) => node.id());
+    if (!nodeIds.length) {
+      communityByNodeRef.current = {};
+      communityMetaRef.current = {};
+      setCommunityCount(0);
+      return;
+    }
+    const neighbors = new Map<string, string[]>();
+    nodeIds.forEach((id) => neighbors.set(id, []));
+    cy.edges().forEach((edge) => {
+      const source = edge.source().id();
+      const target = edge.target().id();
+      neighbors.get(source)?.push(target);
+      neighbors.get(target)?.push(source);
+    });
+    const labels = new Map<string, string>();
+    nodeIds.forEach((id) => labels.set(id, id));
+    const orderedNodes = nodeIds
+      .slice()
+      .sort((a, b) => (neighbors.get(b)?.length ?? 0) - (neighbors.get(a)?.length ?? 0));
+    for (let iter = 0; iter < 18; iter += 1) {
+      let changed = 0;
+      for (const id of orderedNodes) {
+        const nbs = neighbors.get(id) ?? [];
+        if (!nbs.length) continue;
+        const score = new Map<string, number>();
+        nbs.forEach((nb) => {
+          const label = labels.get(nb);
+          if (!label) return;
+          score.set(label, (score.get(label) ?? 0) + 1);
+        });
+        const best = Array.from(score.entries()).sort((a, b) => {
+          if (b[1] !== a[1]) return b[1] - a[1];
+          return a[0].localeCompare(b[0]);
+        })[0]?.[0];
+        if (best && best !== labels.get(id)) {
+          labels.set(id, best);
+          changed += 1;
+        }
+      }
+      if (!changed) break;
+    }
+    const groups = new Map<string, string[]>();
+    labels.forEach((label, nodeId) => {
+      if (!groups.has(label)) groups.set(label, []);
+      groups.get(label)?.push(nodeId);
+    });
+    const ranked = Array.from(groups.entries()).sort((a, b) => b[1].length - a[1].length);
+    const nodeToCommunity: Record<string, string> = {};
+    const meta: Record<string, { label: string; color: string; stroke: string; size: number }> = {};
+    ranked.forEach(([groupId, ids], idx) => {
+      const key = `c${idx + 1}`;
+      ids.forEach((id) => {
+        nodeToCommunity[id] = key;
+      });
+      const topSubField = ids
+        .map((id) => cy.$id(id).data("full")?.sub_field || cy.$id(id).data("full")?.open_sub_field)
+        .filter(Boolean)
+        .reduce<Record<string, number>>((acc, field) => {
+          if (!field) return acc;
+          acc[field] = (acc[field] ?? 0) + 1;
+          return acc;
+        }, {});
+      const topLabel =
+        Object.entries(topSubField).sort((a, b) => b[1] - a[1])[0]?.[0] ??
+        `${t("graph.community")} ${idx + 1}`;
+      const palette = communityPalette[idx % communityPalette.length];
+      meta[key] = { label: topLabel, color: palette.fill, stroke: palette.stroke, size: ids.length };
+      void groupId;
+    });
+    communityByNodeRef.current = nodeToCommunity;
+    communityMetaRef.current = meta;
+    setCommunityCount(ranked.length);
+  };
+
+  const refreshClusterHulls = () => {
+    const cy = cyRef.current;
+    if (!cy || !showClusterHull) {
+      setClusterHulls([]);
+      return;
+    }
+    const container = containerRef.current;
+    if (container) {
+      setCanvasSize({
+        width: container.clientWidth || 800,
+        height: container.clientHeight || 600
+      });
+    }
+    const grouped = new Map<string, string[]>();
+    Object.entries(communityByNodeRef.current).forEach(([nodeId, clusterId]) => {
+      if (!grouped.has(clusterId)) grouped.set(clusterId, []);
+      grouped.get(clusterId)?.push(nodeId);
+    });
+    const hulls: ClusterHullShape[] = [];
+    grouped.forEach((nodeIds, clusterId) => {
+      if (nodeIds.length < 2) return;
+      const points: Array<{ x: number; y: number }> = [];
+      let centerX = 0;
+      let centerY = 0;
+      let count = 0;
+      nodeIds.forEach((nodeId) => {
+        const node = cy.$id(nodeId);
+        if (node.empty()) return;
+        const rendered = node.renderedPosition();
+        const radius = Math.max(12, (node.renderedWidth() || 16) / 2 + 12);
+        points.push(
+          { x: rendered.x - radius, y: rendered.y },
+          { x: rendered.x + radius, y: rendered.y },
+          { x: rendered.x, y: rendered.y - radius },
+          { x: rendered.x, y: rendered.y + radius }
+        );
+        centerX += rendered.x;
+        centerY += rendered.y;
+        count += 1;
+      });
+      if (count < 2 || points.length < 2) return;
+      const meta = communityMetaRef.current[clusterId];
+      hulls.push({
+        id: clusterId,
+        label: meta?.label || `${t("graph.community")} ${clusterId}`,
+        fill: meta?.color || "rgba(99,102,241,0.12)",
+        stroke: meta?.stroke || "#4f46e5",
+        path: pathFromPoints(points),
+        labelX: centerX / count,
+        labelY: centerY / count,
+        size: meta?.size || count
+      });
+    });
+    setClusterHulls(hulls);
+  };
+
+  const scheduleHullRefresh = () => {
+    if (hullRafRef.current !== null) return;
+    hullRafRef.current = window.requestAnimationFrame(() => {
+      hullRafRef.current = null;
+      refreshClusterHulls();
+    });
+  };
+
   const applyLayout = (layoutType: "force" | "hierarchy" | "timeline") => {
     const cy = cyRef.current;
     if (!cy) return;
     if (layoutType === "force") {
+      setTimelineGuides([]);
       cy.layout({ name: "cose", animate: true, padding: 30 }).run();
       return;
     }
     if (layoutType === "hierarchy") {
+      setTimelineGuides([]);
       cy.layout({ name: "breadthfirst", directed: true, padding: 30, spacingFactor: 1.2 }).run();
       return;
     }
@@ -338,10 +578,27 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     const years = nodes
       .map((n: cytoscape.NodeSingular) => n.data("full")?.year)
       .filter(Boolean) as number[];
-    const minYear = Math.min(...years, 2000);
-    const maxYear = Math.max(...years, 2026);
+    const uniqueYears = Array.from(new Set(years)).sort((a, b) => a - b);
+    const minYear = uniqueYears[0] ?? 2000;
+    const maxYear = uniqueYears[uniqueYears.length - 1] ?? 2026;
     const width = containerRef.current?.clientWidth ?? 800;
     const height = containerRef.current?.clientHeight ?? 600;
+    const leftPad = 70;
+    const rightPad = 70;
+    const topPad = 70;
+    const bottomPad = 70;
+    const yearsForScale = uniqueYears.length ? uniqueYears : [minYear, maxYear];
+    const step = yearsForScale.length > 1 ? (width - leftPad - rightPad) / (yearsForScale.length - 1) : 0;
+    const yearToX = new Map<number, number>();
+    yearsForScale.forEach((year, idx) => {
+      yearToX.set(year, leftPad + idx * step);
+    });
+    setTimelineGuides(
+      yearsForScale.map((year) => ({
+        year,
+        x: yearToX.get(year) ?? leftPad
+      }))
+    );
     const positions: Record<string, { x: number; y: number }> = {};
     const groups: Record<number, string[]> = {};
     nodes.forEach((n: cytoscape.NodeSingular) => {
@@ -351,16 +608,29 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     });
     Object.keys(groups).forEach((yearStr) => {
       const year = Number(yearStr);
-      const list = groups[year];
-      const x =
-        60 +
-        ((year - minYear) / Math.max(1, maxYear - minYear)) * (width - 120);
+      const list = groups[year]
+        .slice()
+        .sort((aId, bId) => {
+          const aCommunity = communityByNodeRef.current[aId] || "";
+          const bCommunity = communityByNodeRef.current[bId] || "";
+          if (aCommunity !== bCommunity) return aCommunity.localeCompare(bCommunity);
+          const aNode = cy.$id(aId).data("full");
+          const bNode = cy.$id(bId).data("full");
+          const aScore = Number(aNode?.citation_count ?? aNode?.pagerank ?? 0);
+          const bScore = Number(bNode?.citation_count ?? bNode?.pagerank ?? 0);
+          return bScore - aScore;
+        });
+      const x = yearToX.get(year) ?? leftPad + ((year - minYear) / Math.max(1, maxYear - minYear)) * (width - 140);
+      const usableHeight = Math.max(80, height - topPad - bottomPad);
+      const gap = list.length > 1 ? Math.max(12, Math.min(38, usableHeight / (list.length - 1))) : 0;
+      const totalSpan = (list.length - 1) * gap;
+      const startY = topPad + Math.max(0, (usableHeight - totalSpan) / 2);
       list.forEach((id, idx) => {
-        const y = 50 + (idx % 20) * 24 + Math.floor(idx / 20) * 10;
-        positions[id] = { x, y: Math.min(y, height - 60) };
+        const y = Math.min(height - bottomPad, startY + idx * gap);
+        positions[id] = { x, y };
       });
     });
-    cy.layout({ name: "preset", positions }).run();
+    cy.layout({ name: "preset", positions, animate: true, fit: true, padding: 30 }).run();
   };
 
   useEffect(() => {
@@ -500,6 +770,26 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     return () => {
       window.removeEventListener("scroll", hide, true);
       window.removeEventListener("resize", hide);
+    };
+  }, []);
+
+  useEffect(() => {
+    const cy = cyRef.current;
+    if (!cy) return;
+    const update = () => scheduleHullRefresh();
+    cy.on("zoom pan layoutstop dragfree add remove", update);
+    update();
+    return () => {
+      cy.off("zoom pan layoutstop dragfree add remove", update);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showClusterHull, graph]);
+
+  useEffect(() => {
+    return () => {
+      if (hullRafRef.current !== null) {
+        window.cancelAnimationFrame(hullRafRef.current);
+      }
     };
   }, []);
 
@@ -832,14 +1122,17 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
         edge.addClass(`intent-${intent}`);
       }
     });
+    detectCommunities();
     updateNodeLabels();
     applyLayout(layout);
     applySemanticDeclutter();
+    scheduleHullRefresh();
     clearPathAnimation();
-  }, [graph, showLabels, smartDeclutter]);
+  }, [graph, showLabels, smartDeclutter, layout]);
 
   useEffect(() => {
     applyLayout(layout);
+    scheduleHullRefresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [layout]);
 
@@ -1106,7 +1399,10 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
           }
         }
       });
+      detectCommunities();
       applyLayout(layout);
+      applySemanticDeclutter();
+      scheduleHullRefresh();
     } catch {
       message.error(t("msg.neighbors_failed"));
     }
@@ -2180,6 +2476,10 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
         <Switch checked={smartDeclutter} onChange={setSmartDeclutter} />
       </div>
       <div className="graph-advanced-row">
+        <Text type="secondary">{t("graph.cluster_hull")}</Text>
+        <Switch checked={showClusterHull} onChange={setShowClusterHull} />
+      </div>
+      <div className="graph-advanced-row">
         <Text type="secondary">{t("graph.labels")}</Text>
         <Switch checked={showLabels} onChange={setShowLabels} />
       </div>
@@ -2320,6 +2620,9 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
               <Tag className="soft-tag soft-tag-red">
                 {t("sync.failed")} {syncStatus.failed ?? 0}
               </Tag>
+              <Tag className="soft-tag soft-tag-violet">
+                {t("graph.community_count")} {communityCount}
+              </Tag>
               <Popover trigger="click" placement="bottomRight" content={advancedControls}>
                 <Button icon={<SettingOutlined />}>{t("filters.title")}</Button>
               </Popover>
@@ -2331,6 +2634,37 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
             <div className="graph-loading">
               <Spin />
             </div>
+          )}
+          {layout === "timeline" && timelineGuides.length > 0 && (
+            <div className="graph-year-guides">
+              {timelineGuides.map((guide) => (
+                <div key={guide.year} className="graph-year-guide" style={{ left: guide.x }}>
+                  <span>{guide.year}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {showClusterHull && clusterHulls.length > 0 && (
+            <svg
+              className="graph-cluster-hulls"
+              viewBox={`0 0 ${canvasSize.width} ${canvasSize.height}`}
+              preserveAspectRatio="none"
+            >
+              {clusterHulls.map((cluster) => (
+                <g key={cluster.id}>
+                  <path
+                    d={cluster.path}
+                    fill={cluster.fill}
+                    stroke={cluster.stroke}
+                    strokeWidth={1.2}
+                    className="graph-cluster-hull-path"
+                  />
+                  <text x={cluster.labelX} y={cluster.labelY} className="graph-cluster-hull-label">
+                    {cluster.label} · {cluster.size}
+                  </text>
+                </g>
+              ))}
+            </svg>
           )}
           <div ref={containerRef} className="graph-cytoscape" />
           <div className={`graph-floating-capsule ${!pathSourceId && !pathTargetId ? "is-idle" : ""}`}>
