@@ -1881,6 +1881,14 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     }
   };
 
+  const clearShortestPath = () => {
+    if (!cyRef.current) return;
+    cyRef.current.nodes().removeClass("path-step");
+    cyRef.current.edges().removeClass("path-edge");
+    setPathSourceId(undefined);
+    setPathTargetId(undefined);
+  };
+
   const askPaperQa = async () => {
     const query = qaQuery.trim();
     if (!query) return;
@@ -2269,6 +2277,46 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
             { label: t("sort.pagerank"), value: "pagerank" }
           ]}
         />
+      </div>
+      <div className="graph-path-side-panel">
+        <Space direction="vertical" size={8} style={{ width: "100%" }}>
+          <Text strong>{t("graph.shortest_path")}</Text>
+          <Text type="secondary">{t("graph.path_context_hint")}</Text>
+          <Select
+            allowClear
+            showSearch
+            style={{ width: "100%" }}
+            placeholder={t("graph.path_source")}
+            value={pathSourceId}
+            options={pathNodeOptions}
+            onChange={(value) => setPathSourceId(value)}
+          />
+          <Select
+            allowClear
+            showSearch
+            style={{ width: "100%" }}
+            placeholder={t("graph.path_target")}
+            value={pathTargetId}
+            options={pathNodeOptions}
+            onChange={(value) => setPathTargetId(value)}
+          />
+          <Space size={8} wrap>
+            <Button icon={<AimOutlined />} type="primary" loading={pathLoading} onClick={highlightShortestPath}>
+              {t("graph.shortest_path")}
+            </Button>
+            <Button icon={<DeleteOutlined />} onClick={clearShortestPath}>
+              {t("graph.clear_shortest_path")}
+            </Button>
+          </Space>
+          <Space size={8} wrap>
+            <Tag className="soft-tag soft-tag-indigo">
+              {t("graph.path_source")}: {pathSourceId || "-"}
+            </Tag>
+            <Tag className="soft-tag soft-tag-violet">
+              {t("graph.path_target")}: {pathTargetId || "-"}
+            </Tag>
+          </Space>
+        </Space>
       </div>
       <Space size="small" wrap>
         <Button onClick={handleExportCsv} disabled={!strategy || strategy === "cluster"}>
@@ -3007,50 +3055,6 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
             </svg>
           )}
           <div ref={containerRef} className="graph-cytoscape" />
-          <div className={`graph-floating-capsule ${!pathSourceId && !pathTargetId ? "is-idle" : ""}`}>
-            <Space size="small" wrap>
-              <Text type="secondary">{t("graph.path_context_hint")}</Text>
-              <Select
-                allowClear
-                showSearch
-                style={{ width: 210 }}
-                placeholder={t("graph.path_source")}
-                value={pathSourceId}
-                options={pathNodeOptions}
-                onChange={(value) => setPathSourceId(value)}
-              />
-              <Select
-                allowClear
-                showSearch
-                style={{ width: 210 }}
-                placeholder={t("graph.path_target")}
-                value={pathTargetId}
-                options={pathNodeOptions}
-                onChange={(value) => setPathTargetId(value)}
-              />
-              <Button icon={<AimOutlined />} type="primary" loading={pathLoading} onClick={highlightShortestPath}>
-                {t("graph.shortest_path")}
-              </Button>
-              <Button
-                icon={<DeleteOutlined />}
-                onClick={() => {
-                  if (!cyRef.current) return;
-                  cyRef.current.nodes().removeClass("path-step");
-                  cyRef.current.edges().removeClass("path-edge");
-                  setPathSourceId(undefined);
-                  setPathTargetId(undefined);
-                }}
-              >
-                {t("graph.clear_shortest_path")}
-              </Button>
-              <Tag className="soft-tag soft-tag-indigo">
-                {t("graph.path_source")}: {pathSourceId || "-"}
-              </Tag>
-              <Tag className="soft-tag soft-tag-violet">
-                {t("graph.path_target")}: {pathTargetId || "-"}
-              </Tag>
-            </Space>
-          </div>
           <div className="graph-floating-timeline">
             {bubbleLabel && (
               <div className="timeline-bubble">

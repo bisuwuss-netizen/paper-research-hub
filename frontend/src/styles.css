@@ -424,6 +424,13 @@ body {
   padding-right: 4px;
 }
 
+.graph-path-side-panel {
+  border: 0.5px solid rgba(203, 213, 225, 0.7);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.45);
+  padding: 10px;
+}
+
 .graph-topbar {
   position: absolute;
   top: 24px;
