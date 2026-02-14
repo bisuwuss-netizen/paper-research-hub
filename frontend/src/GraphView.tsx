@@ -32,7 +32,9 @@ import {
   SyncOutlined,
   AimOutlined,
   DeleteOutlined,
-  SettingOutlined
+  SettingOutlined,
+  LeftOutlined,
+  RightOutlined
 } from "@ant-design/icons";
 import { jsPDF } from "jspdf";
 import {
@@ -181,6 +183,7 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(true);
   const [sidebarDrawerOpen, setSidebarDrawerOpen] = useState(false);
   const [inspectorTab, setInspectorTab] = useState<"details" | "chat">("details");
+  const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
   const [readingMode, setReadingMode] = useState(false);
   const [showClusterHull, setShowClusterHull] = useState(true);
   const [clusterHulls, setClusterHulls] = useState<ClusterHullShape[]>([]);
@@ -343,12 +346,12 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
   };
 
   const communityPalette = [
-    { fill: "rgba(99, 102, 241, 0.12)", stroke: "#4f46e5" },
-    { fill: "rgba(20, 184, 166, 0.12)", stroke: "#0f766e" },
-    { fill: "rgba(245, 158, 11, 0.12)", stroke: "#b45309" },
-    { fill: "rgba(239, 68, 68, 0.11)", stroke: "#b91c1c" },
-    { fill: "rgba(168, 85, 247, 0.12)", stroke: "#7e22ce" },
-    { fill: "rgba(14, 165, 233, 0.12)", stroke: "#0369a1" }
+    { fill: "rgba(99, 102, 241, 0.045)", stroke: "rgba(79, 70, 229, 0.34)" },
+    { fill: "rgba(20, 184, 166, 0.042)", stroke: "rgba(15, 118, 110, 0.34)" },
+    { fill: "rgba(245, 158, 11, 0.042)", stroke: "rgba(180, 83, 9, 0.34)" },
+    { fill: "rgba(239, 68, 68, 0.04)", stroke: "rgba(185, 28, 28, 0.33)" },
+    { fill: "rgba(168, 85, 247, 0.045)", stroke: "rgba(126, 34, 206, 0.34)" },
+    { fill: "rgba(14, 165, 233, 0.042)", stroke: "rgba(3, 105, 161, 0.34)" }
   ];
 
   const convexHull = (points: Array<{ x: number; y: number }>) => {
@@ -499,8 +502,9 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
 
   const refreshClusterHulls = () => {
     const cy = cyRef.current;
-    if (!cy || !showClusterHull) {
+    if (!cy) {
       setClusterHulls([]);
+      setTimelineGuides([]);
       return;
     }
     const container = containerRef.current;
@@ -510,6 +514,30 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
         height: container.clientHeight || 600
       });
     }
+    if (layout === "timeline") {
+      const yearMap = new Map<number, number[]>();
+      cy.nodes().forEach((node) => {
+        const year = Number(node.data("full")?.year ?? 0);
+        if (!year) return;
+        if (!yearMap.has(year)) yearMap.set(year, []);
+        yearMap.get(year)?.push(node.renderedPosition().x);
+      });
+      const guideRows = Array.from(yearMap.entries())
+        .map(([year, xs]) => ({
+          year,
+          x: xs.reduce((acc, val) => acc + val, 0) / Math.max(1, xs.length)
+        }))
+        .sort((a, b) => a.year - b.year);
+      setTimelineGuides(guideRows);
+    } else {
+      setTimelineGuides([]);
+    }
+
+    if (!showClusterHull) {
+      setClusterHulls([]);
+      return;
+    }
+
     const grouped = new Map<string, string[]>();
     Object.entries(communityByNodeRef.current).forEach(([nodeId, clusterId]) => {
       if (!grouped.has(clusterId)) grouped.set(clusterId, []);
@@ -566,7 +594,18 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     if (!cy) return;
     if (layoutType === "force") {
       setTimelineGuides([]);
-      cy.layout({ name: "cose", animate: true, padding: 30 }).run();
+      cy.layout({
+        name: "cose",
+        animate: true,
+        fit: true,
+        padding: 64,
+        randomize: true,
+        nodeRepulsion: () => 18000,
+        idealEdgeLength: () => 170,
+        edgeElasticity: () => 80,
+        gravity: 0.08,
+        numIter: 1800
+      }).run();
       return;
     }
     if (layoutType === "hierarchy") {
@@ -593,12 +632,6 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     yearsForScale.forEach((year, idx) => {
       yearToX.set(year, leftPad + idx * step);
     });
-    setTimelineGuides(
-      yearsForScale.map((year) => ({
-        year,
-        x: yearToX.get(year) ?? leftPad
-      }))
-    );
     const positions: Record<string, { x: number; y: number }> = {};
     const groups: Record<number, string[]> = {};
     nodes.forEach((n: cytoscape.NodeSingular) => {
@@ -765,11 +798,14 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
 
   useEffect(() => {
     const hide = () => setMenu((prev) => ({ ...prev, visible: false }));
+    const onResize = () => scheduleHullRefresh();
     window.addEventListener("scroll", hide, true);
     window.addEventListener("resize", hide);
+    window.addEventListener("resize", onResize);
     return () => {
       window.removeEventListener("scroll", hide, true);
       window.removeEventListener("resize", hide);
+      window.removeEventListener("resize", onResize);
     };
   }, []);
 
@@ -1085,6 +1121,14 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     cy.elements().remove();
 
     const elements: cytoscape.ElementDefinition[] = [];
+    const ranked = graph.nodes
+      .map((node) => ({
+        id: node.id.toString(),
+        score: Number(node.citation_count ?? node.pagerank ?? node.citation_velocity ?? 0)
+      }))
+      .sort((a, b) => b.score - a.score);
+    const topCount = Math.max(1, Math.ceil(ranked.length * 0.1));
+    const topLabelIds = new Set(ranked.slice(0, topCount).map((item) => item.id));
     graph.nodes.forEach((node) => {
       baseColors.current[node.id.toString()] = node.color;
       const compactLabel = shortLabel(node.label);
@@ -1096,6 +1140,7 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
           fullLabel: compactLabel,
           labelOpacity: 0,
           labelBgOpacity: 0,
+          topLabel: topLabelIds.has(node.id.toString()) ? 1 : 0,
           size: node.size,
           color: node.color,
           full: node
@@ -1276,6 +1321,7 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
       const base = node.data("fullLabel") || shortLabel(node.data("full")?.label || "");
       const isSelected = selectedId === id;
       const isHovered = hoveredNodeIdRef.current === id;
+      const isTopLabel = Number(node.data("topLabel")) === 1;
       let shouldShow = false;
       if (!labelsEnabled) {
         shouldShow = isSelected || isHovered;
@@ -1288,8 +1334,9 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
         shouldShow =
           isSelected ||
           isHovered ||
+          (isTopLabel && zoom >= 0.78) ||
           (total <= 50 && zoom >= 0.7) ||
-          (total <= 120 && zoom >= 1.0) ||
+          (total <= 120 && zoom >= 0.95) ||
           zoom >= 1.3;
       }
       node.data("displayLabel", shouldShow ? base : "");
@@ -2522,6 +2569,12 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
 
   return (
     <div className={`graph-shell ${standalone ? "is-standalone" : ""} ${sidebarCollapsed ? "is-sidebar-collapsed" : ""}`}>
+      <div className="graph-floating-brand">
+        <Text strong>PaperTrail</Text>
+        <Button size="small" onClick={() => (window.location.href = "/")}>
+          {t("nav.home")}
+        </Button>
+      </div>
       <div className={`graph-sidebar ${sidebarCollapsed ? "is-collapsed" : ""}`}>
         <Card className="graph-card graph-sidebar-card" size="small">
           <div className="graph-sidebar-header">
@@ -2748,32 +2801,45 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
           </div>
         </div>
       </div>
-      <div className="graph-inspector">
-        <Card className="graph-card graph-inspector-card" size="small">
-          <Tabs
-            size="small"
-            activeKey={inspectorTab}
-            onChange={(key) => setInspectorTab(key as "details" | "chat")}
-            tabBarExtraContent={
-              <Space size={6} className="inspector-reading-toggle">
-                <Text type="secondary">{t("inspector.reading_mode")}</Text>
-                <Switch size="small" checked={readingMode} onChange={setReadingMode} />
-              </Space>
-            }
-            items={[
-              {
-                key: "details",
-                label: t("details.title"),
-                children: detailsPanel
-              },
-              {
-                key: "chat",
-                label: t("qa.title"),
-                children: chatPanel
-              }
-            ]}
+      <div className={`graph-inspector ${inspectorCollapsed ? "is-collapsed" : ""}`}>
+        {inspectorCollapsed ? (
+          <Button
+            className="graph-inspector-collapse-btn"
+            icon={<LeftOutlined />}
+            onClick={() => setInspectorCollapsed(false)}
           />
-        </Card>
+        ) : (
+          <Card className="graph-card graph-inspector-card" size="small">
+            <Tabs
+              size="small"
+              activeKey={inspectorTab}
+              onChange={(key) => setInspectorTab(key as "details" | "chat")}
+              tabBarExtraContent={
+                <Space size={6} className="inspector-reading-toggle">
+                  <Text type="secondary">{t("inspector.reading_mode")}</Text>
+                  <Switch size="small" checked={readingMode} onChange={setReadingMode} />
+                  <Button
+                    type="text"
+                    icon={<RightOutlined />}
+                    onClick={() => setInspectorCollapsed(true)}
+                  />
+                </Space>
+              }
+              items={[
+                {
+                  key: "details",
+                  label: t("details.title"),
+                  children: detailsPanel
+                },
+                {
+                  key: "chat",
+                  label: t("qa.title"),
+                  children: chatPanel
+                }
+              ]}
+            />
+          </Card>
+        )}
       </div>
       {menu.visible && menu.node && (
         <div

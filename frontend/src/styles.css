@@ -202,7 +202,9 @@ body {
 }
 
 .app-content.is-graph-page {
-  padding: 16px 20px 28px;
+  padding: 0;
+  gap: 0;
+  overflow: hidden;
 }
 
 .hero-card {
@@ -299,53 +301,65 @@ body {
 }
 
 .graph-shell {
-  display: grid;
-  grid-template-columns: 280px minmax(0, 1fr) 400px;
-  gap: 16px;
-  min-height: calc(100vh - 220px);
-  align-items: stretch;
-  width: 100%;
-  max-width: 100%;
-  overflow-x: clip;
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  z-index: 30;
+  background:
+    radial-gradient(circle at 12% 10%, rgba(224, 231, 255, 0.7), transparent 42%),
+    radial-gradient(circle at 88% 12%, rgba(191, 219, 254, 0.54), transparent 46%),
+    linear-gradient(180deg, #f8fbff 0%, #f2f6fc 100%);
 }
 
 .graph-shell.is-standalone {
-  min-height: calc(100vh - 210px);
+  inset: 0;
 }
 
 .graph-shell.is-sidebar-collapsed,
 .graph-shell.is-standalone.is-sidebar-collapsed {
-  grid-template-columns: 64px minmax(0, 1fr) 400px;
+  inset: 0;
 }
 
 .graph-page {
-  width: 100%;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
 }
 
 .graph-sidebar,
 .graph-inspector,
 .graph-workbench {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  min-width: 0;
+  position: absolute;
+  z-index: 9;
 }
 
 .graph-sidebar {
-  min-height: 0;
+  top: 82px;
+  left: 24px;
+  width: 286px;
+  transition: width 0.2s ease;
+}
+
+.graph-sidebar.is-collapsed {
+  width: 72px;
 }
 
 .graph-main {
-  min-height: 0;
-  position: relative;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
+  position: absolute;
+  inset: 0;
+  z-index: 1;
 }
 
 .graph-inspector {
-  min-height: 0;
+  top: 82px;
+  right: 24px;
+  width: 396px;
+}
+
+.graph-inspector.is-collapsed {
+  width: auto;
 }
 
 .graph-workbench {
@@ -353,12 +367,13 @@ body {
 }
 
 .graph-sidebar-card {
-  position: sticky;
-  top: 10px;
-  max-height: calc(100vh - 170px);
+  max-height: calc(100vh - 114px);
   overflow: hidden;
+  border-radius: 24px;
+  border: 0.5px solid rgba(226, 232, 240, 0.9);
   background: rgba(255, 255, 255, 0.68);
-  backdrop-filter: blur(18px);
+  backdrop-filter: blur(24px);
+  box-shadow: 0 14px 38px rgba(51, 65, 85, 0.12);
 }
 
 .graph-sidebar-card .ant-card-body {
@@ -388,16 +403,24 @@ body {
 }
 
 .graph-sidebar-card .ant-tabs-content-holder {
-  max-height: calc(100vh - 240px);
+  max-height: calc(100vh - 188px);
   overflow: auto;
   padding-right: 4px;
 }
 
 .graph-topbar {
-  margin-bottom: 0;
+  position: absolute;
+  top: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  width: min(980px, calc(100vw - 560px));
   border-radius: 26px;
-  background: rgba(255, 255, 255, 0.64);
-  backdrop-filter: blur(18px);
+  border: 0.5px solid rgba(226, 232, 240, 0.9);
+  background: rgba(255, 255, 255, 0.72);
+  backdrop-filter: blur(22px);
+  box-shadow: 0 12px 30px rgba(51, 65, 85, 0.12);
+  pointer-events: auto;
 }
 
 .graph-topbar-row {
@@ -437,18 +460,22 @@ body {
 }
 
 .graph-canvas {
-  height: 620px;
-  border-radius: 28px;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.82) 0%, rgba(239, 246, 255, 0.7) 100%);
-  border: 0.5px solid var(--border);
+  position: absolute;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  border-radius: 0;
+  background:
+    radial-gradient(circle at 15% 18%, rgba(196, 206, 255, 0.16), transparent 48%),
+    radial-gradient(circle at 78% 22%, rgba(168, 196, 255, 0.12), transparent 44%),
+    linear-gradient(180deg, #f7fbff 0%, #eef4fb 100%);
   overflow: hidden;
-  position: relative;
-  box-shadow: var(--shadow-hard);
+  box-shadow: none;
 }
 
 .graph-shell.is-standalone .graph-canvas {
-  height: calc(100vh - 320px);
-  min-height: 700px;
+  width: 100vw;
+  height: 100vh;
 }
 
 .graph-cytoscape {
@@ -480,24 +507,51 @@ body {
 }
 
 .graph-inspector .graph-card {
-  position: sticky;
-  top: 10px;
-  max-height: calc(100vh - 170px);
+  max-height: calc(100vh - 114px);
   overflow: hidden;
+  border-radius: 24px;
+  border: 0.5px solid rgba(226, 232, 240, 0.9);
   background: rgba(255, 255, 255, 0.66);
   backdrop-filter: blur(22px);
+  box-shadow: 0 14px 38px rgba(51, 65, 85, 0.12);
 }
 
 .graph-inspector .graph-inspector-card .ant-card-body {
-  max-height: calc(100vh - 220px);
+  max-height: calc(100vh - 168px);
   overflow: auto;
   padding-right: 10px;
 }
 
 .graph-inspector .graph-inspector-card .ant-tabs-content-holder {
-  max-height: calc(100vh - 270px);
+  max-height: calc(100vh - 220px);
   overflow: auto;
   padding-right: 6px;
+}
+
+.graph-inspector-collapse-btn {
+  width: 48px;
+  height: 48px;
+  border-radius: 16px;
+  border: 0.5px solid rgba(226, 232, 240, 0.9);
+  background: rgba(255, 255, 255, 0.72);
+  backdrop-filter: blur(18px);
+  box-shadow: 0 12px 28px rgba(51, 65, 85, 0.14);
+}
+
+.graph-floating-brand {
+  position: absolute;
+  top: 24px;
+  left: 24px;
+  z-index: 11;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 16px;
+  border: 0.5px solid rgba(226, 232, 240, 0.9);
+  background: rgba(255, 255, 255, 0.72);
+  backdrop-filter: blur(18px);
+  box-shadow: 0 12px 28px rgba(51, 65, 85, 0.14);
 }
 
 .graph-loading {
@@ -598,10 +652,10 @@ body {
 
 .graph-floating-capsule {
   position: absolute;
-  top: 16px;
+  top: 102px;
   left: 50%;
   transform: translateX(-50%);
-  z-index: 4;
+  z-index: 8;
   max-width: calc(100% - 48px);
   padding: 10px 14px;
   border-radius: 999px;
@@ -629,7 +683,7 @@ body {
   left: 50%;
   bottom: 14px;
   transform: translateX(-50%);
-  z-index: 4;
+  z-index: 8;
   width: min(900px, calc(100% - 56px));
   padding: 12px 16px 10px;
   border-radius: 22px;
@@ -692,18 +746,18 @@ body {
 }
 
 .graph-cluster-hull-path {
-  stroke-dasharray: 4 3;
+  stroke-dasharray: 3 5;
   filter: saturate(90%);
 }
 
 .graph-cluster-hull-label {
-  font-size: 11px;
-  fill: #334155;
+  font-size: 10px;
+  fill: #475569;
   text-anchor: middle;
   paint-order: stroke;
-  stroke: rgba(248, 250, 252, 0.88);
+  stroke: rgba(248, 250, 252, 0.95);
   stroke-width: 3px;
-  font-weight: 600;
+  font-weight: 500;
 }
 
 .graph-year-guides {
@@ -715,7 +769,7 @@ body {
 
 .graph-year-guide {
   position: absolute;
-  top: 14px;
+  top: 110px;
   bottom: 72px;
   width: 1px;
   border-left: 0.5px dashed rgba(148, 163, 184, 0.55);
@@ -739,120 +793,86 @@ body {
 }
 
 @media (max-width: 1380px) {
-  .graph-shell,
-  .graph-shell.is-standalone {
-    grid-template-columns: 64px minmax(0, 1fr) 360px;
+  .graph-topbar {
+    width: min(840px, calc(100vw - 500px));
   }
 
-  .graph-shell.is-sidebar-collapsed,
-  .graph-shell.is-standalone.is-sidebar-collapsed {
-    grid-template-columns: 64px minmax(0, 1fr) 360px;
-  }
-
-  .graph-inspector .graph-card {
-    position: relative;
-    top: auto;
-    max-height: none;
-  }
-
-  .graph-inspector .graph-card .ant-card-body,
-  .graph-workbench .graph-card .ant-card-body {
-    max-height: none;
-    overflow: visible;
-  }
-
-  .graph-shell.is-standalone .graph-canvas {
-    min-height: 520px;
-    height: calc(100vh - 360px);
+  .graph-inspector {
+    width: 360px;
   }
 
   .graph-floating-capsule {
-    max-width: calc(100% - 32px);
-    border-radius: 26px;
+    max-width: calc(100vw - 520px);
+  }
+}
+
+@media (max-width: 1180px) {
+  .graph-topbar {
+    width: min(760px, calc(100vw - 140px));
+    left: 50%;
+  }
+
+  .graph-floating-capsule {
+    max-width: calc(100vw - 160px);
+  }
+
+  .graph-inspector {
+    right: 18px;
+    width: 332px;
   }
 }
 
 @media (max-width: 1024px) {
-  .graph-shell {
-    grid-template-columns: 1fr;
-  }
-
-  .graph-shell.is-standalone {
-    grid-template-columns: 1fr;
-  }
-
-  .graph-shell.is-sidebar-collapsed,
-  .graph-shell.is-standalone.is-sidebar-collapsed {
-    grid-template-columns: 1fr;
-  }
-
   .graph-sidebar {
     display: none;
   }
 
-  .graph-inspector .graph-card {
-    position: relative;
+  .graph-floating-brand {
+    top: 12px;
+    left: 12px;
+    padding: 8px 10px;
+  }
+
+  .graph-topbar {
+    top: 12px;
+    width: calc(100vw - 24px);
+    left: 50%;
+    transform: translateX(-50%);
+  }
+
+  .graph-inspector {
+    right: 12px;
     top: auto;
-    max-height: none;
+    bottom: 96px;
+    width: min(420px, calc(100vw - 24px));
+  }
+
+  .graph-inspector .graph-card {
+    max-height: 44vh;
   }
 
   .graph-inspector .graph-inspector-card .ant-card-body,
   .graph-inspector .graph-inspector-card .ant-tabs-content-holder {
-    max-height: none;
-    overflow: visible;
-  }
-
-  .graph-sidebar-card {
-    position: relative;
-    top: auto;
-    max-height: none;
-  }
-
-  .graph-sidebar-card .ant-tabs-content-holder {
-    max-height: none;
-  }
-
-  .app-header-inner {
-    flex-direction: column;
-    align-items: flex-start;
-  }
-
-  .app-actions {
-    align-items: flex-start;
-  }
-}
-
-@media (max-width: 768px) {
-  .app-header,
-  .app-content {
-    padding: 18px;
-  }
-
-  .graph-canvas {
-    height: 420px;
-  }
-
-  .graph-shell.is-standalone .graph-canvas {
-    min-height: 480px;
-    height: 480px;
+    max-height: 33vh;
   }
 
   .graph-floating-capsule {
-    top: 10px;
-    width: calc(100% - 20px);
-    border-radius: 16px;
+    top: 88px;
+    width: calc(100vw - 24px);
+    max-width: none;
+    border-radius: 18px;
     padding: 8px 10px;
   }
 
   .graph-floating-timeline {
-    width: calc(100% - 20px);
+    width: calc(100vw - 24px);
     bottom: 10px;
     padding: 8px 10px;
     border-radius: 16px;
   }
 
-  .hero-card {
-    flex-direction: column;
-    align-items: flex-start;
+  .graph-year-guide {
+    top: 98px;
+    bottom: 66px;
   }
 }
