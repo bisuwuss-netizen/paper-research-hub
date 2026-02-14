@@ -126,6 +126,7 @@ type ClusterHullShape = {
   label: string;
   fill: string;
   stroke: string;
+  fillOpacity: number;
   path: string;
   labelX: number;
   labelY: number;
@@ -360,13 +361,31 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
   };
 
   const communityPalette = [
-    { fill: "rgba(99, 102, 241, 0.045)", stroke: "rgba(79, 70, 229, 0.34)" },
-    { fill: "rgba(20, 184, 166, 0.042)", stroke: "rgba(15, 118, 110, 0.34)" },
-    { fill: "rgba(245, 158, 11, 0.042)", stroke: "rgba(180, 83, 9, 0.34)" },
-    { fill: "rgba(239, 68, 68, 0.04)", stroke: "rgba(185, 28, 28, 0.33)" },
-    { fill: "rgba(168, 85, 247, 0.045)", stroke: "rgba(126, 34, 206, 0.34)" },
-    { fill: "rgba(14, 165, 233, 0.042)", stroke: "rgba(3, 105, 161, 0.34)" }
+    { fill: "rgba(99, 102, 241, 0.018)", stroke: "rgba(79, 70, 229, 0.28)" },
+    { fill: "rgba(20, 184, 166, 0.016)", stroke: "rgba(15, 118, 110, 0.28)" },
+    { fill: "rgba(245, 158, 11, 0.016)", stroke: "rgba(180, 83, 9, 0.28)" },
+    { fill: "rgba(239, 68, 68, 0.016)", stroke: "rgba(185, 28, 28, 0.28)" },
+    { fill: "rgba(168, 85, 247, 0.018)", stroke: "rgba(126, 34, 206, 0.28)" },
+    { fill: "rgba(14, 165, 233, 0.016)", stroke: "rgba(3, 105, 161, 0.28)" }
   ];
+
+  const timelinePadding = {
+    left: 84,
+    right: 84,
+    top: 150,
+    bottom: 118
+  };
+
+  const withAlpha = (value: string, alpha: number) => {
+    const match = value.match(/^rgba?\(([^)]+)\)$/i);
+    if (!match) return value;
+    const parts = match[1]
+      .split(",")
+      .map((part) => part.trim())
+      .slice(0, 3);
+    if (parts.length !== 3) return value;
+    return `rgba(${parts[0]}, ${parts[1]}, ${parts[2]}, ${alpha})`;
+  };
 
   const convexHull = (points: Array<{ x: number; y: number }>) => {
     if (points.length <= 1) return points;
@@ -530,12 +549,17 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
         if (!yearMap.has(year)) yearMap.set(year, []);
         yearMap.get(year)?.push(node.renderedPosition().x);
       });
-      const guideRows = Array.from(yearMap.entries())
-        .map(([year, xs]) => ({
-          year,
-          x: xs.reduce((acc, val) => acc + val, 0) / Math.max(1, xs.length)
-        }))
-        .sort((a, b) => a.year - b.year);
+      const width = containerRef.current?.clientWidth ?? 800;
+      const allYears = Array.from(yearMap.keys()).sort((a, b) => a - b);
+      const minYear = allYears[0] ?? 2000;
+      const maxYear = allYears[allYears.length - 1] ?? 2026;
+      const span = Math.max(1, maxYear - minYear);
+      const guideRows = allYears.map((year) => ({
+        year,
+        x:
+          timelinePadding.left +
+          ((year - minYear) / span) * (width - timelinePadding.left - timelinePadding.right)
+      }));
       setTimelineGuides(guideRows);
     } else {
       setTimelineGuides([]);
@@ -553,7 +577,7 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     });
     const hulls: ClusterHullShape[] = [];
     grouped.forEach((nodeIds, clusterId) => {
-      if (nodeIds.length < 2) return;
+      if (nodeIds.length < 3) return;
       const points: Array<{ x: number; y: number }> = [];
       let centerX = 0;
       let centerY = 0;
@@ -575,11 +599,14 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
       });
       if (count < 2 || points.length < 2) return;
       const meta = communityMetaRef.current[clusterId];
+      const fillOpacity = count >= 24 ? 0.32 : count >= 12 ? 0.42 : 0.56;
+      const fillBase = meta?.color || "rgba(99, 102, 241, 0.016)";
       hulls.push({
         id: clusterId,
         label: meta?.label || `${t("graph.community")} ${clusterId}`,
-        fill: meta?.color || "rgba(99,102,241,0.12)",
-        stroke: meta?.stroke || "#4f46e5",
+        fill: withAlpha(fillBase, Math.max(0.006, 0.02 - count * 0.00025)),
+        stroke: meta?.stroke || "rgba(79,70,229,0.28)",
+        fillOpacity,
         path: pathFromPoints(points),
         labelX: centerX / count,
         labelY: centerY / count,
@@ -604,14 +631,6 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     setCanvasSize((prev) => (prev.width === width && prev.height === height ? prev : { width, height }));
   };
 
-  const hashSign = (value: string) => {
-    let sum = 0;
-    for (let idx = 0; idx < value.length; idx += 1) {
-      sum = (sum + value.charCodeAt(idx) * (idx + 1)) % 9973;
-    }
-    return sum % 2 === 0 ? 1 : -1;
-  };
-
   const refreshEdgeBundles = () => {
     const cy = cyRef.current;
     if (!cy) {
@@ -629,78 +648,177 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     const visibleEdges = cy
       .edges()
       .filter((edge) => !edge.hasClass("focus-dim") && !edge.hasClass("declutter-edge"));
-    if (visibleEdges.length < 40) {
+    if (visibleEdges.length < 28) {
       setBundledPaths([]);
       return;
     }
 
-    const grouped = new Map<
-      string,
-      Array<{
-        source: { x: number; y: number };
-        target: { x: number; y: number };
-      }>
-    >();
-    visibleEdges.forEach((edge) => {
-      const sourceId = edge.source().id();
-      const targetId = edge.target().id();
-      const sourceCluster = communityByNodeRef.current[sourceId] || sourceId;
-      const targetCluster = communityByNodeRef.current[targetId] || targetId;
-      const key = `${sourceCluster}->${targetCluster}`;
-      if (!grouped.has(key)) grouped.set(key, []);
-      grouped.get(key)?.push({
-        source: edge.source().renderedPosition(),
-        target: edge.target().renderedPosition()
-      });
-    });
-
-    const bundles: EdgeBundlePath[] = [];
-    grouped.forEach((links, key) => {
-      if (links.length < 3) return;
-      const sourceCenter = links.reduce(
-        (acc, item) => ({ x: acc.x + item.source.x, y: acc.y + item.source.y }),
-        { x: 0, y: 0 }
-      );
-      sourceCenter.x /= links.length;
-      sourceCenter.y /= links.length;
-
-      const targetCenter = links.reduce(
-        (acc, item) => ({ x: acc.x + item.target.x, y: acc.y + item.target.y }),
-        { x: 0, y: 0 }
-      );
-      targetCenter.x /= links.length;
-      targetCenter.y /= links.length;
-
-      const dx = targetCenter.x - sourceCenter.x;
-      const dy = targetCenter.y - sourceCenter.y;
-      const distance = Math.hypot(dx, dy) || 1;
-      const nx = -dy / distance;
-      const ny = dx / distance;
-      const offset = Math.min(120, 20 + Math.log(links.length + 1) * 24);
-      const sign = hashSign(key);
-      const cx = (sourceCenter.x + targetCenter.x) / 2 + nx * offset * sign;
-      const cyMid = (sourceCenter.y + targetCenter.y) / 2 + ny * offset * sign;
-      const sourceCluster = key.split("->")[0] || "";
-      const bundleStroke = communityMetaRef.current[sourceCluster]?.stroke || "rgba(79,70,229,0.34)";
-      bundles.push({
-        id: key,
-        path: `M ${sourceCenter.x} ${sourceCenter.y} Q ${cx} ${cyMid} ${targetCenter.x} ${targetCenter.y}`,
-        stroke: bundleStroke,
-        width: Math.max(1.4, Math.min(7, 1 + Math.log(links.length + 1) * 1.35)),
-        opacity: Math.min(0.42, 0.1 + Math.log(links.length + 1) * 0.09),
-        count: links.length,
-        labelX: cx,
-        labelY: cyMid
-      });
-    });
-
-    if (!bundles.length) {
-      setBundledPaths([]);
-      return;
-    }
-
+    const MAX_BUNDLE_EDGES = 200;
+    const edgeList = visibleEdges.toArray() as unknown as cytoscape.EdgeSingular[];
     visibleEdges.addClass("bundled-edge");
-    setBundledPaths(bundles.sort((a, b) => b.count - a.count));
+
+    const rankedEdges = edgeList
+      .map((edge) => {
+        const confidence = Number(edge.data("confidence") ?? 0.65);
+        const degreeScore = (edge.source().degree(false) + edge.target().degree(false)) * 0.025;
+        return { edge, score: confidence * 0.72 + degreeScore };
+      })
+      .sort((a, b) => b.score - a.score)
+      .slice(0, MAX_BUNDLE_EDGES)
+      .map((item) => item.edge);
+
+    if (rankedEdges.length < 18) {
+      setBundledPaths([]);
+      return;
+    }
+
+    type Vec = { x: number; y: number };
+    type BundleEdge = {
+      id: string;
+      sourceId: string;
+      targetId: string;
+      source: Vec;
+      target: Vec;
+      points: Vec[];
+    };
+
+    const subdivisions = 7;
+    const makeLinearPoints = (a: Vec, b: Vec) =>
+      Array.from({ length: subdivisions + 1 }, (_, idx) => {
+        const tRatio = idx / subdivisions;
+        return {
+          x: a.x + (b.x - a.x) * tRatio,
+          y: a.y + (b.y - a.y) * tRatio
+        };
+      });
+
+    const length = (a: Vec, b: Vec) => Math.hypot(b.x - a.x, b.y - a.y);
+    const dot = (a: Vec, b: Vec) => a.x * b.x + a.y * b.y;
+    const midpoint = (a: Vec, b: Vec) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+    const sub = (a: Vec, b: Vec) => ({ x: a.x - b.x, y: a.y - b.y });
+
+    const bundleEdges: BundleEdge[] = rankedEdges.map((edge) => {
+      const source = edge.source().renderedPosition();
+      const target = edge.target().renderedPosition();
+      return {
+        id: edge.id(),
+        sourceId: edge.source().id(),
+        targetId: edge.target().id(),
+        source,
+        target,
+        points: makeLinearPoints(source, target)
+      };
+    });
+
+    const compat: Array<Array<{ idx: number; w: number }>> = Array.from(
+      { length: bundleEdges.length },
+      () => []
+    );
+    const compatibilityThreshold = 0.22;
+    for (let i = 0; i < bundleEdges.length; i += 1) {
+      for (let j = i + 1; j < bundleEdges.length; j += 1) {
+        const e = bundleEdges[i];
+        const f = bundleEdges[j];
+        const eVec = sub(e.target, e.source);
+        const fVec = sub(f.target, f.source);
+        const eLen = Math.max(1, Math.hypot(eVec.x, eVec.y));
+        const fLen = Math.max(1, Math.hypot(fVec.x, fVec.y));
+        const angleComp = Math.abs(dot(eVec, fVec) / (eLen * fLen));
+        const scaleComp = 2 / (eLen / fLen + fLen / eLen);
+        const midE = midpoint(e.source, e.target);
+        const midF = midpoint(f.source, f.target);
+        const midDist = length(midE, midF);
+        const posComp = ((eLen + fLen) / 2) / (((eLen + fLen) / 2) + midDist);
+        const visComp = Math.max(0, 1 - midDist / (eLen + fLen));
+        const compatibility = angleComp * scaleComp * posComp * visComp;
+        if (compatibility >= compatibilityThreshold) {
+          compat[i].push({ idx: j, w: compatibility });
+          compat[j].push({ idx: i, w: compatibility });
+        }
+      }
+    }
+
+    let step = 0.22;
+    const iterations = bundleEdges.length > 140 ? 9 : 13;
+    for (let iter = 0; iter < iterations; iter += 1) {
+      const snapshot = bundleEdges.map((edge) => edge.points.map((p) => ({ ...p })));
+      for (let edgeIdx = 0; edgeIdx < bundleEdges.length; edgeIdx += 1) {
+        const edge = bundleEdges[edgeIdx];
+        const links = compat[edgeIdx];
+        if (!links.length) continue;
+        for (let pointIdx = 1; pointIdx < subdivisions; pointIdx += 1) {
+          const point = snapshot[edgeIdx][pointIdx];
+          const prev = snapshot[edgeIdx][pointIdx - 1];
+          const next = snapshot[edgeIdx][pointIdx + 1];
+          const spring = {
+            x: (prev.x + next.x) * 0.5 - point.x,
+            y: (prev.y + next.y) * 0.5 - point.y
+          };
+          let attractX = 0;
+          let attractY = 0;
+          let totalW = 0;
+          for (const link of links) {
+            const peerPoint = snapshot[link.idx][pointIdx];
+            const dx = peerPoint.x - point.x;
+            const dy = peerPoint.y - point.y;
+            const dist = Math.hypot(dx, dy);
+            if (dist > 260) continue;
+            const influence = link.w / (1 + dist * 0.02);
+            attractX += dx * influence;
+            attractY += dy * influence;
+            totalW += influence;
+          }
+          const bundleForce =
+            totalW > 0
+              ? {
+                  x: attractX / totalW,
+                  y: attractY / totalW
+                }
+              : { x: 0, y: 0 };
+          edge.points[pointIdx] = {
+            x: point.x + (spring.x * 0.34 + bundleForce.x * 0.66) * step,
+            y: point.y + (spring.y * 0.34 + bundleForce.y * 0.66) * step
+          };
+        }
+      }
+      step *= 0.88;
+    }
+
+    const toSmoothPath = (points: Vec[]) => {
+      if (points.length < 2) return "";
+      if (points.length === 2) {
+        return `M ${points[0].x} ${points[0].y} L ${points[1].x} ${points[1].y}`;
+      }
+      let d = `M ${points[0].x} ${points[0].y}`;
+      for (let idx = 1; idx < points.length - 1; idx += 1) {
+        const current = points[idx];
+        const next = points[idx + 1];
+        const mid = { x: (current.x + next.x) / 2, y: (current.y + next.y) / 2 };
+        d += ` Q ${current.x} ${current.y} ${mid.x} ${mid.y}`;
+      }
+      const last = points[points.length - 1];
+      d += ` T ${last.x} ${last.y}`;
+      return d;
+    };
+
+    const paths = bundleEdges.map((edge, idx) => {
+      const sourceCluster = communityByNodeRef.current[edge.sourceId] || "";
+      const stroke = communityMetaRef.current[sourceCluster]?.stroke || "rgba(79,70,229,0.34)";
+      const degreeWeight = Math.max(0, compat[idx].length);
+      const center = edge.points[Math.floor(edge.points.length / 2)];
+      return {
+        id: edge.id,
+        path: toSmoothPath(edge.points),
+        stroke,
+        width: Math.max(0.9, Math.min(3.2, 0.95 + Math.log(degreeWeight + 1) * 0.72)),
+        opacity: Math.min(0.28, 0.08 + Math.log(degreeWeight + 2) * 0.06),
+        count: degreeWeight,
+        labelX: center.x,
+        labelY: center.y
+      };
+    });
+
+    setBundledPaths(paths);
   };
 
   const scheduleBundleRefresh = () => {
@@ -720,10 +838,10 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
         name: "cose",
         animate: true,
         fit: true,
-        padding: 64,
+        padding: 132,
         randomize: true,
-        nodeRepulsion: () => 18000,
-        idealEdgeLength: () => 170,
+        nodeRepulsion: () => 21000,
+        idealEdgeLength: () => 195,
         edgeElasticity: () => 80,
         gravity: 0.08,
         numIter: 1800
@@ -732,7 +850,7 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     }
     if (layoutType === "hierarchy") {
       setTimelineGuides([]);
-      cy.layout({ name: "breadthfirst", directed: true, padding: 30, spacingFactor: 1.2 }).run();
+      cy.layout({ name: "breadthfirst", directed: true, padding: 110, spacingFactor: 1.35 }).run();
       return;
     }
     const nodes = cy.nodes();
@@ -744,15 +862,15 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     const maxYear = uniqueYears[uniqueYears.length - 1] ?? 2026;
     const width = containerRef.current?.clientWidth ?? 800;
     const height = containerRef.current?.clientHeight ?? 600;
-    const leftPad = 70;
-    const rightPad = 70;
-    const topPad = 70;
-    const bottomPad = 70;
-    const yearsForScale = uniqueYears.length ? uniqueYears : [minYear, maxYear];
-    const step = yearsForScale.length > 1 ? (width - leftPad - rightPad) / (yearsForScale.length - 1) : 0;
+    const leftPad = timelinePadding.left;
+    const rightPad = timelinePadding.right;
+    const topPad = timelinePadding.top;
+    const bottomPad = timelinePadding.bottom;
+    const span = Math.max(1, maxYear - minYear);
+    const usableWidth = Math.max(60, width - leftPad - rightPad);
     const yearToX = new Map<number, number>();
-    yearsForScale.forEach((year, idx) => {
-      yearToX.set(year, leftPad + idx * step);
+    uniqueYears.forEach((year) => {
+      yearToX.set(year, leftPad + ((year - minYear) / span) * usableWidth);
     });
     const positions: Record<string, { x: number; y: number }> = {};
     const groups: Record<number, string[]> = {};
@@ -775,7 +893,7 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
           const bScore = Number(bNode?.citation_count ?? bNode?.pagerank ?? 0);
           return bScore - aScore;
         });
-      const x = yearToX.get(year) ?? leftPad + ((year - minYear) / Math.max(1, maxYear - minYear)) * (width - 140);
+      const x = yearToX.get(year) ?? leftPad + ((year - minYear) / span) * usableWidth;
       const usableHeight = Math.max(80, height - topPad - bottomPad);
       const gap = list.length > 1 ? Math.max(12, Math.min(38, usableHeight / (list.length - 1))) : 0;
       const totalSpan = (list.length - 1) * gap;
@@ -785,7 +903,7 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
         positions[id] = { x, y };
       });
     });
-    cy.layout({ name: "preset", positions, animate: true, fit: true, padding: 30 }).run();
+    cy.layout({ name: "preset", positions, animate: true, fit: true, padding: 110 }).run();
   };
 
   useEffect(() => {
@@ -1021,9 +1139,9 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
               "background-color": "data(color)",
               label: "data(displayLabel)",
               color: "#0f172a",
-              "font-size": 6,
+              "font-size": 5,
               "text-wrap": "wrap",
-              "text-max-width": "78",
+              "text-max-width": "66",
               "min-zoomed-font-size": 5,
               width: "data(size)",
               height: "data(size)",
@@ -1031,9 +1149,10 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
               "text-halign": "center",
               "text-margin-y": -5,
               "text-background-color": "#ffffff",
-              "text-background-opacity": 0.62,
-              "text-background-padding": "1.5",
-              "text-opacity": 0.9
+              "text-background-opacity": (node: cytoscape.NodeSingular) =>
+                Number(node.data("labelBgOpacity") ?? 0),
+              "text-background-padding": "1.2",
+              "text-opacity": (node: cytoscape.NodeSingular) => Number(node.data("labelOpacity") ?? 0)
             }
           },
           {
@@ -1268,7 +1387,8 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
         score: Number(node.citation_count ?? node.pagerank ?? node.citation_velocity ?? 0)
       }))
       .sort((a, b) => b.score - a.score);
-    const topCount = Math.max(1, Math.ceil(ranked.length * 0.1));
+    const topRatio = ranked.length > 420 ? 0.04 : ranked.length > 220 ? 0.06 : ranked.length > 120 ? 0.08 : 0.1;
+    const topCount = Math.max(1, Math.ceil(ranked.length * topRatio));
     const topLabelIds = new Set(ranked.slice(0, topCount).map((item) => item.id));
     graph.nodes.forEach((node) => {
       baseColors.current[node.id.toString()] = node.color;
@@ -1477,14 +1597,14 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
         shouldShow =
           isSelected ||
           isHovered ||
-          (isTopLabel && zoom >= 0.78) ||
-          (total <= 50 && zoom >= 0.7) ||
-          (total <= 120 && zoom >= 0.95) ||
-          zoom >= 1.3;
+          (isTopLabel && zoom >= (total > 220 ? 1.02 : 0.92)) ||
+          (total <= 42 && zoom >= 0.8) ||
+          (total <= 90 && zoom >= 1.0) ||
+          zoom >= 1.42;
       }
       node.data("displayLabel", shouldShow ? base : "");
       node.data("labelOpacity", shouldShow ? 0.95 : 0);
-      node.data("labelBgOpacity", shouldShow ? 0.78 : 0);
+      node.data("labelBgOpacity", shouldShow ? 0.52 : 0);
     });
   };
 
@@ -2885,6 +3005,7 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
                   <path
                     d={cluster.path}
                     fill={cluster.fill}
+                    fillOpacity={cluster.fillOpacity}
                     stroke={cluster.stroke}
                     strokeWidth={1.2}
                     className="graph-cluster-hull-path"
