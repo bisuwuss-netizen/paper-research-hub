@@ -4,6 +4,7 @@ import cytoscape from "cytoscape";
 import {
   Card,
   Select,
+  Segmented,
   Slider,
   Space,
   Typography,
@@ -19,8 +20,20 @@ import {
   Tabs,
   Badge,
   Divider,
-  Drawer
+  Drawer,
+  Tooltip,
+  Popover
 } from "antd";
+import {
+  MenuFoldOutlined,
+  MenuUnfoldOutlined,
+  FilterOutlined,
+  AppstoreOutlined,
+  SyncOutlined,
+  AimOutlined,
+  DeleteOutlined,
+  SettingOutlined
+} from "@ant-design/icons";
 import { jsPDF } from "jspdf";
 import {
   fetchGraph,
@@ -126,6 +139,7 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
   const [uploadedOnly, setUploadedOnly] = useState(true);
   const [edgeFocus, setEdgeFocus] = useState<"all" | "out" | "in">("all");
   const [focusMode, setFocusMode] = useState(false);
+  const [smartDeclutter, setSmartDeclutter] = useState(true);
   const [edgeIntentFilter, setEdgeIntentFilter] = useState<
     "all" | "build_on" | "contrast" | "use_as_baseline" | "mention"
   >("all");
@@ -153,8 +167,10 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
   const [backfillLimit, setBackfillLimit] = useState(5);
   const [edgeMinConfidence, setEdgeMinConfidence] = useState<number>(0);
   const [sidebarTab, setSidebarTab] = useState<"filters" | "legend" | "sync">("filters");
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(true);
   const [sidebarDrawerOpen, setSidebarDrawerOpen] = useState(false);
+  const [inspectorTab, setInspectorTab] = useState<"details" | "chat">("details");
+  const [readingMode, setReadingMode] = useState(false);
   const [note, setNote] = useState<PaperNote | null>(null);
   const [noteSaving, setNoteSaving] = useState(false);
   const [backlinks, setBacklinks] = useState<BacklinksResponse | null>(null);
@@ -668,6 +684,20 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
               "border-width": 4,
               "border-color": "#0ea5e9"
             }
+          },
+          {
+            selector: ".declutter-edge",
+            style: {
+              opacity: 0.03,
+              width: 0.35
+            }
+          },
+          {
+            selector: ".declutter-node",
+            style: {
+              opacity: 0.16,
+              "text-opacity": 0
+            }
           }
         ]
       });
@@ -702,6 +732,7 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
       });
       cyRef.current.on("zoom", () => {
         updateNodeLabels();
+        applySemanticDeclutter();
       });
       cyRef.current.on("tap", () => {
         setMenu((prev) => ({ ...prev, visible: false }));
@@ -733,6 +764,7 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
         neighbors.removeClass("focus-dim").addClass("focus-edge");
         neighbors.nodes().removeClass("focus-dim");
       }
+      applySemanticDeclutter();
       return;
     }
     const nodeId = selected.id.toString();
@@ -749,7 +781,8 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     filteredEdges.removeClass("focus-dim").addClass("focus-edge");
     filteredEdges.sources().removeClass("focus-dim");
     filteredEdges.targets().removeClass("focus-dim");
-  }, [edgeFocus, edgeIntentFilter, focusMode, selected, graph]);
+    applySemanticDeclutter();
+  }, [edgeFocus, edgeIntentFilter, focusMode, selected, graph, smartDeclutter]);
 
   useEffect(() => {
     fetchData(subField, yearRange);
@@ -801,8 +834,9 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     });
     updateNodeLabels();
     applyLayout(layout);
+    applySemanticDeclutter();
     clearPathAnimation();
-  }, [graph, showLabels]);
+  }, [graph, showLabels, smartDeclutter]);
 
   useEffect(() => {
     applyLayout(layout);
@@ -917,6 +951,18 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     return graph.meta.sub_fields.map((s) => ({ label: s, value: s }));
   }, [graph, subfields]);
 
+  const pathNodeOptions = useMemo(() => {
+    if (!graph?.nodes?.length) return [];
+    return graph.nodes
+      .slice()
+      .sort((a, b) => (b.year || 0) - (a.year || 0))
+      .slice(0, 400)
+      .map((node) => ({
+        label: `#${node.id} ${(node.label || "").replace(/\s+/g, " ").trim().slice(0, 42)}`,
+        value: node.id
+      }));
+  }, [graph]);
+
   const shortLabel = (value: string) => {
     if (!value) return "";
     const compact = value.replace(/\s+/g, " ").trim();
@@ -957,6 +1003,35 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
       node.data("labelOpacity", shouldShow ? 0.95 : 0);
       node.data("labelBgOpacity", shouldShow ? 0.78 : 0);
     });
+  };
+
+  const applySemanticDeclutter = () => {
+    const cy = cyRef.current;
+    if (!cy) return;
+    cy.edges().removeClass("declutter-edge");
+    cy.nodes().removeClass("declutter-node");
+    if (!smartDeclutter) return;
+
+    const zoom = cy.zoom();
+    const selectedId = selected ? selected.id.toString() : null;
+    const nodeCount = cy.nodes().length;
+    const edgeCount = cy.edges().length;
+
+    if (edgeCount > 220 && zoom < 0.95) {
+      cy.edges().forEach((edge) => {
+        if (selectedId && (edge.source().id() === selectedId || edge.target().id() === selectedId)) return;
+        edge.addClass("declutter-edge");
+      });
+    }
+
+    if (nodeCount > 280 && zoom < 0.78) {
+      cy.nodes().forEach((node) => {
+        if (selectedId && node.id() === selectedId) return;
+        if (node.degree(false) <= 1) {
+          node.addClass("declutter-node");
+        }
+      });
+    }
   };
 
   useEffect(() => {
@@ -1647,29 +1722,31 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
 
   const legendPanel = (
     <Space direction="vertical" size="small" style={{ width: "100%" }}>
-      <Tag color="red">{t("legend.ccf")}</Tag>
-      <Tag color="blue">{t("legend.global")}</Tag>
-      <Tag color="green">{t("legend.cnki")}</Tag>
-      <Tag color="default">{t("legend.ref_only")}</Tag>
-      <Tag color="gold">
+      <Tag className="soft-tag soft-tag-red">{t("legend.ccf")}</Tag>
+      <Tag className="soft-tag soft-tag-indigo">{t("legend.global")}</Tag>
+      <Tag className="soft-tag soft-tag-emerald">{t("legend.cnki")}</Tag>
+      <Tag className="soft-tag soft-tag-slate">{t("legend.ref_only")}</Tag>
+      <Tag className="soft-tag soft-tag-amber">
         {t("legend.size_by")} {sizeBy === "pagerank" ? t("size.pagerank") : t("size.citations")}
       </Tag>
       <Text type="secondary">{t("sync.queue")}</Text>
       <Space size="small" wrap>
-        <Tag color="blue">
+        <Tag className="soft-tag soft-tag-indigo">
           {t("sync.queued")} {syncStatus.queued ?? 0}
         </Tag>
-        <Tag color="gold">
+        <Tag className="soft-tag soft-tag-amber">
           {t("sync.running")} {syncStatus.running ?? 0}
         </Tag>
-        <Tag color="green">
+        <Tag className="soft-tag soft-tag-emerald">
           {t("sync.idle")} {syncStatus.idle ?? 0}
         </Tag>
-        <Tag color="red">
+        <Tag className="soft-tag soft-tag-red">
           {t("sync.failed")} {syncStatus.failed ?? 0}
         </Tag>
-        <Tag color="purple">jobs {Object.values(syncStatus.jobs || {}).reduce((acc, cur) => acc + Number(cur || 0), 0)}</Tag>
-        <Tag color={(syncStatus.alerts_open ?? 0) > 0 ? "red" : "green"}>
+        <Tag className="soft-tag soft-tag-violet">
+          jobs {Object.values(syncStatus.jobs || {}).reduce((acc, cur) => acc + Number(cur || 0), 0)}
+        </Tag>
+        <Tag className={`soft-tag ${(syncStatus.alerts_open ?? 0) > 0 ? "soft-tag-red" : "soft-tag-emerald"}`}>
           alerts {syncStatus.alerts_open ?? 0}
         </Tag>
       </Space>
@@ -1680,16 +1757,16 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     <Space direction="vertical" size="small" style={{ width: "100%" }}>
       <Text type="secondary">{t("sync.queue")}</Text>
       <Space size="small" wrap>
-        <Tag color="blue">
+        <Tag className="soft-tag soft-tag-indigo">
           {t("sync.queued")} {syncStatus.queued ?? 0}
         </Tag>
-        <Tag color="gold">
+        <Tag className="soft-tag soft-tag-amber">
           {t("sync.running")} {syncStatus.running ?? 0}
         </Tag>
-        <Tag color="green">
+        <Tag className="soft-tag soft-tag-emerald">
           {t("sync.idle")} {syncStatus.idle ?? 0}
         </Tag>
-        <Tag color="red">
+        <Tag className="soft-tag soft-tag-red">
           {t("sync.failed")} {syncStatus.failed ?? 0}
         </Tag>
       </Space>
@@ -1827,11 +1904,369 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
     </Space>
   );
 
+  const detailsPanel = selected ? (
+    <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+      <div>
+        <Title level={5} style={{ margin: 0 }}>
+          {shortLabel(selected.label)}
+        </Title>
+        <Text type="secondary">{selected.authors || t("details.unknown_authors")}</Text>
+      </div>
+      <Space size="small" wrap>
+        {selected.year && <Tag>{selected.year}</Tag>}
+        {selected.sub_field && <Tag className="soft-tag soft-tag-indigo">{selected.sub_field}</Tag>}
+        {!selected.sub_field && selected.open_sub_field && <Tag className="soft-tag soft-tag-violet">{selected.open_sub_field}</Tag>}
+        {selected.ccf_level && <Tag className="soft-tag soft-tag-red">CCF {selected.ccf_level}</Tag>}
+      </Space>
+      <Space size="small" wrap>
+        <Button
+          size="small"
+          onClick={async () => {
+            if (!selected) return;
+            const next = selected.read_status === 1 ? 0 : 1;
+            const updated = await updatePaper(selected.id, { read_status: next });
+            setSelected({ ...selected, read_status: updated.read_status ?? next });
+            message.success(next === 1 ? t("msg.mark_read") : t("msg.mark_unread"));
+            fetchData(subField, yearRange);
+            await maybeAutoPush(updated.id, selected.zotero_item_key);
+          }}
+        >
+          {selected.read_status === 1 ? t("details.mark_unread") : t("details.mark_read")}
+        </Button>
+        <Button size="small" onClick={() => setInspectorTab("chat")}>
+          {t("qa.title")}
+        </Button>
+        {!readingMode && (
+          <>
+            <Button size="small" onClick={() => addToComparison(selected.id)}>
+              {t("compare.add")}
+            </Button>
+            <Button size="small" onClick={() => setPathSourceId(selected.id)}>
+              {t("compare.set_source")}
+            </Button>
+            <Button size="small" onClick={() => setPathTargetId(selected.id)}>
+              {t("compare.set_target")}
+            </Button>
+            <Button size="small" onClick={loadNeighbors}>
+              {t("details.load_neighbors")}
+            </Button>
+          </>
+        )}
+      </Space>
+      {!readingMode && (
+        <div>
+          <Text type="secondary">{t("details.sub_field")}</Text>
+          <Select
+            allowClear
+            style={{ width: "100%", marginTop: 6 }}
+            options={subFieldOptions}
+            value={selected.sub_field ?? undefined}
+            onChange={async (value) => {
+              if (!selected) return;
+              const updated = await updatePaper(selected.id, { sub_field: value ?? null });
+              setSelected({ ...selected, sub_field: updated.sub_field ?? null });
+              message.success(t("msg.subfield_updated"));
+              await maybeAutoPush(updated.id, selected.zotero_item_key);
+            }}
+            placeholder={t("details.sub_field")}
+          />
+        </div>
+      )}
+      <Paragraph style={{ whiteSpace: "pre-wrap", marginBottom: 0 }}>
+        {selected.abstract || t("details.no_abstract")}
+      </Paragraph>
+      {selected.summary_one && (
+        <div>
+          <Text type="secondary">{t("details.summary")}</Text>
+          <Paragraph type="secondary" style={{ marginBottom: 0 }}>
+            {selected.summary_one}
+          </Paragraph>
+        </div>
+      )}
+      <Space size="small" wrap>
+        {selected.citation_count !== null && (
+          <Tag className="soft-tag soft-tag-amber">
+            {t("details.citations")}: {selected.citation_count ?? 0}
+          </Tag>
+        )}
+        {selected.reference_count !== null && (
+          <Tag className="soft-tag soft-tag-violet">
+            {t("details.references")}: {selected.reference_count ?? 0}
+          </Tag>
+        )}
+      </Space>
+      {!readingMode && (
+        <>
+          <div>
+            <Text type="secondary">{t("details.zotero_key")}</Text>
+            <Input
+              value={zoteroKey}
+              onChange={(e) => setZoteroKey(e.target.value)}
+              placeholder="e.g. ABCD1234"
+              style={{ marginTop: 6 }}
+            />
+            {selected.zotero_item_id && (
+              <Text type="secondary" style={{ display: "block", marginTop: 6 }}>
+                {t("details.zotero_id")}: {selected.zotero_item_id} ({selected.zotero_library ?? "user"})
+              </Text>
+            )}
+          </div>
+          <Space size="small" wrap>
+            <Button
+              onClick={async () => {
+                if (!selected) return;
+                const updated = await updatePaper(selected.id, { zotero_item_key: zoteroKey });
+                setSelected({
+                  ...selected,
+                  zotero_item_key: updated.zotero_item_key ?? null,
+                  zotero_library: updated.zotero_library ?? null,
+                  zotero_item_id: updated.zotero_item_id ?? null
+                });
+                message.success(t("msg.zotero_saved"));
+                await maybeAutoPush(updated.id, updated.zotero_item_key ?? null);
+              }}
+            >
+              {t("details.save")}
+            </Button>
+            <Button
+              onClick={async () => {
+                if (!selected) return;
+                try {
+                  const updated = await matchZotero(selected.id);
+                  setSelected({
+                    ...selected,
+                    zotero_item_key: updated.zotero_item_key ?? null,
+                    zotero_library: updated.zotero_library ?? null,
+                    zotero_item_id: updated.zotero_item_id ?? null
+                  });
+                  setZoteroKey(updated.zotero_item_key ?? "");
+                  message.success(t("msg.zotero_matched"));
+                } catch (err: any) {
+                  message.error(err?.response?.data?.detail || t("msg.zotero_match_failed"));
+                }
+              }}
+            >
+              {t("details.match")}
+            </Button>
+            <Button
+              onClick={async () => {
+                if (!selected) return;
+                try {
+                  await pushZotero(selected.id);
+                  message.success(t("msg.zotero_pushed"));
+                } catch (err: any) {
+                  message.error(err?.response?.data?.detail || t("msg.zotero_update_failed"));
+                }
+              }}
+            >
+              {t("details.push")}
+            </Button>
+            <Button
+              type="primary"
+              onClick={() => {
+                if (!selected?.zotero_item_key) {
+                  message.warning(t("msg.zotero_key_required"));
+                  return;
+                }
+                const library = selected.zotero_library || "";
+                let url = `zotero://select/library/items/${selected.zotero_item_key}`;
+                if (library.startsWith("group:")) {
+                  const groupId = library.split(":")[1];
+                  if (groupId) {
+                    url = `zotero://select/groups/${groupId}/items/${selected.zotero_item_key}`;
+                  }
+                }
+                window.location.href = url;
+              }}
+            >
+              {t("details.open")}
+            </Button>
+          </Space>
+        </>
+      )}
+    </Space>
+  ) : (
+    <Text type="secondary">{t("details.select_hint")}</Text>
+  );
+
+  const chatPanel = (
+    <Space direction="vertical" size="small" style={{ width: "100%" }}>
+      <Space size="small" wrap>
+        <Select
+          allowClear
+          style={{ width: 200 }}
+          value={chatSessionId}
+          placeholder={t("qa.session")}
+          options={chatSessions.map((session) => ({
+            label: `#${session.id} ${session.title || ""}`.trim(),
+            value: session.id
+          }))}
+          onChange={(value) => setChatSessionId(value)}
+        />
+        <Button
+          onClick={async () => {
+            const session = await createChatSession({ title: qaQuery.slice(0, 30), language: "zh" });
+            setChatSessionId(session.id);
+            await refreshChatSessions();
+          }}
+        >
+          {t("qa.new_session")}
+        </Button>
+      </Space>
+      <Select
+        value={qaMode}
+        onChange={(value) => setQaMode(value as "single" | "compare")}
+        options={[
+          { label: t("qa.single"), value: "single" },
+          { label: t("qa.multi"), value: "compare" }
+        ]}
+      />
+      <Input.TextArea
+        value={qaQuery}
+        onChange={(e) => setQaQuery(e.target.value)}
+        placeholder={t("qa.placeholder")}
+        autoSize={{ minRows: 2, maxRows: 4 }}
+      />
+      <Button type="primary" onClick={askPaperQa} loading={qaLoading}>
+        {t("qa.ask")}
+      </Button>
+      <List
+        size="small"
+        dataSource={chatHistory.slice(-8)}
+        locale={{ emptyText: t("qa.history_empty") }}
+        renderItem={(msg) => (
+          <List.Item>
+            <Space direction="vertical" size={0}>
+              <Text strong>{msg.role === "assistant" ? "AI" : "You"}</Text>
+              <Text type="secondary">{msg.content.slice(0, 220)}</Text>
+            </Space>
+          </List.Item>
+        )}
+      />
+      {qaResult && (
+        <>
+          <Paragraph style={{ whiteSpace: "pre-wrap" }}>{qaResult.answer}</Paragraph>
+          {typeof qaResult.trace_score === "number" && (
+            <Tag color={qaResult.trace_score >= 0.6 ? "green" : qaResult.trace_score >= 0.4 ? "gold" : "red"}>
+              Traceability: {qaResult.trace_score.toFixed(2)}
+            </Tag>
+          )}
+          <List
+            size="small"
+            header={<Text type="secondary">{t("qa.sources")}</Text>}
+            dataSource={qaResult.sources}
+            renderItem={(source) => (
+              <List.Item>
+                <Text type="secondary">
+                  #{source.paper_id} {source.title}{" "}
+                  {source.chunk_index !== undefined ? ` [chunk ${source.chunk_index}]` : ""}
+                </Text>
+              </List.Item>
+            )}
+          />
+        </>
+      )}
+    </Space>
+  );
+
+  const advancedControls = (
+    <Space direction="vertical" size="middle" className="graph-advanced-controls">
+      <div className="graph-advanced-row">
+        <Text type="secondary">{t("graph.focus")}</Text>
+        <Switch checked={focusMode} onChange={setFocusMode} />
+      </div>
+      <div className="graph-advanced-row">
+        <Text type="secondary">{t("graph.smart_declutter")}</Text>
+        <Switch checked={smartDeclutter} onChange={setSmartDeclutter} />
+      </div>
+      <div className="graph-advanced-row">
+        <Text type="secondary">{t("graph.labels")}</Text>
+        <Switch checked={showLabels} onChange={setShowLabels} />
+      </div>
+      <div>
+        <Text type="secondary">{t("graph.intent_all")}</Text>
+        <Select
+          value={edgeIntentFilter}
+          style={{ width: "100%", marginTop: 8 }}
+          onChange={(value) =>
+            setEdgeIntentFilter(value as "all" | "build_on" | "contrast" | "use_as_baseline" | "mention")
+          }
+          options={[
+            { label: t("graph.intent_all"), value: "all" },
+            { label: t("graph.intent_build_on"), value: "build_on" },
+            { label: t("graph.intent_contrast"), value: "contrast" },
+            { label: t("graph.intent_baseline"), value: "use_as_baseline" },
+            { label: t("graph.intent_mention"), value: "mention" }
+          ]}
+        />
+      </div>
+      <div>
+        <Text type="secondary">{t("graph.label_auto")}</Text>
+        <Select
+          value={labelMode}
+          style={{ width: "100%", marginTop: 8 }}
+          onChange={(value) => setLabelMode(value as "auto" | "selected" | "all")}
+          options={[
+            { label: t("graph.label_auto"), value: "auto" },
+            { label: t("graph.label_selected"), value: "selected" },
+            { label: t("graph.label_all"), value: "all" }
+          ]}
+        />
+      </div>
+      <Button block onClick={classifyIntents}>
+        {t("graph.classify_intent")}
+      </Button>
+      {!selected && <Text type="secondary">{t("graph.relation_hint")}</Text>}
+    </Space>
+  );
+
   return (
     <div className={`graph-shell ${standalone ? "is-standalone" : ""} ${sidebarCollapsed ? "is-sidebar-collapsed" : ""}`}>
-      {!sidebarCollapsed && (
-        <div className="graph-sidebar">
-          <Card className="graph-card graph-sidebar-card" size="small">
+      <div className={`graph-sidebar ${sidebarCollapsed ? "is-collapsed" : ""}`}>
+        <Card className="graph-card graph-sidebar-card" size="small">
+          <div className="graph-sidebar-header">
+            <Tooltip title={sidebarCollapsed ? t("graph.open_panel") : t("graph.maximize_graph")} placement="right">
+              <Button
+                type="text"
+                icon={sidebarCollapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
+                onClick={() => setSidebarCollapsed((prev) => !prev)}
+              />
+            </Tooltip>
+          </div>
+          {sidebarCollapsed ? (
+            <Space direction="vertical" size="small" className="graph-sidebar-icons">
+              <Tooltip title={t("filters.title")} placement="right">
+                <Button
+                  type={sidebarTab === "filters" ? "primary" : "text"}
+                  icon={<FilterOutlined />}
+                  onClick={() => {
+                    setSidebarTab("filters");
+                    setSidebarCollapsed(false);
+                  }}
+                />
+              </Tooltip>
+              <Tooltip title={t("legend.title")} placement="right">
+                <Button
+                  type={sidebarTab === "legend" ? "primary" : "text"}
+                  icon={<AppstoreOutlined />}
+                  onClick={() => {
+                    setSidebarTab("legend");
+                    setSidebarCollapsed(false);
+                  }}
+                />
+              </Tooltip>
+              <Tooltip title={t("sync.title")} placement="right">
+                <Button
+                  type={sidebarTab === "sync" ? "primary" : "text"}
+                  icon={<SyncOutlined />}
+                  onClick={() => {
+                    setSidebarTab("sync");
+                    setSidebarCollapsed(false);
+                  }}
+                />
+              </Tooltip>
+            </Space>
+          ) : (
             <Tabs
               size="small"
               activeKey={sidebarTab}
@@ -1842,89 +2277,88 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
                 { key: "sync", label: t("sync.title"), children: syncPanel }
               ]}
             />
-          </Card>
-        </div>
-      )}
+          )}
+        </Card>
+      </div>
       <div className="graph-main">
         <Card className="graph-card graph-topbar" size="small">
-          <Space direction="vertical" size="small" style={{ width: "100%" }}>
+          <div className="graph-topbar-row">
             <Space size="small" wrap>
               <Button
                 onClick={() => {
-                  if (sidebarCollapsed) {
+                  if (window.innerWidth <= 1024) {
                     setSidebarDrawerOpen(true);
-                  } else {
-                    setSidebarCollapsed(true);
+                    return;
                   }
+                  setSidebarCollapsed((prev) => !prev);
                 }}
               >
                 {sidebarCollapsed ? t("graph.open_panel") : t("graph.maximize_graph")}
               </Button>
               <Text type="secondary">{t("graph.relation_mode")}</Text>
-              <Button
-                type={edgeFocus === "out" ? "primary" : "default"}
-                onClick={() => {
-                  const next = edgeFocus === "out" ? "all" : "out";
-                  setEdgeFocus(next);
+              <Segmented
+                className="graph-relation-segment"
+                value={edgeFocus}
+                options={[
+                  { label: t("details.show_refs"), value: "out" },
+                  { label: t("details.show_cited"), value: "in" },
+                  { label: t("details.show_all"), value: "all" }
+                ]}
+                onChange={(value) => {
+                  setEdgeFocus(value as "all" | "out" | "in");
                   if (selected) loadNeighbors();
                 }}
-              >
-                {t("details.show_refs")}
-              </Button>
-              <Button
-                type={edgeFocus === "in" ? "primary" : "default"}
-                onClick={() => {
-                  const next = edgeFocus === "in" ? "all" : "in";
-                  setEdgeFocus(next);
-                  if (selected) loadNeighbors();
-                }}
-              >
-                {t("details.show_cited")}
-              </Button>
-              {edgeFocus !== "all" && (
-                <Button onClick={() => setEdgeFocus("all")}>{t("details.show_all")}</Button>
-              )}
-              <Switch checked={focusMode} onChange={setFocusMode} />
-              <Text type="secondary">{t("graph.focus")}</Text>
-              <Select
-                value={edgeIntentFilter}
-                style={{ width: 170 }}
-                onChange={(value) =>
-                  setEdgeIntentFilter(
-                    value as "all" | "build_on" | "contrast" | "use_as_baseline" | "mention"
-                  )
-                }
-                options={[
-                  { label: t("graph.intent_all"), value: "all" },
-                  { label: t("graph.intent_build_on"), value: "build_on" },
-                  { label: t("graph.intent_contrast"), value: "contrast" },
-                  { label: t("graph.intent_baseline"), value: "use_as_baseline" },
-                  { label: t("graph.intent_mention"), value: "mention" }
-                ]}
               />
-              <Button onClick={classifyIntents}>{t("graph.classify_intent")}</Button>
-              <Switch checked={showLabels} onChange={setShowLabels} />
-              <Text type="secondary">{t("graph.labels")}</Text>
-              <Select
-                value={labelMode}
-                style={{ width: 120 }}
-                onChange={(value) => setLabelMode(value as "auto" | "selected" | "all")}
-                options={[
-                  { label: t("graph.label_auto"), value: "auto" },
-                  { label: t("graph.label_selected"), value: "selected" },
-                  { label: t("graph.label_all"), value: "all" }
-                ]}
-              />
-              {!selected && <Text type="secondary">{t("graph.relation_hint")}</Text>}
             </Space>
             <Space size="small" wrap>
-              <Tag>{t("graph.path_source")}: {pathSourceId || "-"}</Tag>
-              <Tag>{t("graph.path_target")}: {pathTargetId || "-"}</Tag>
+              <Tag className="soft-tag soft-tag-indigo">
+                {t("sync.queued")} {syncStatus.queued ?? 0}
+              </Tag>
+              <Tag className="soft-tag soft-tag-amber">
+                {t("sync.running")} {syncStatus.running ?? 0}
+              </Tag>
+              <Tag className="soft-tag soft-tag-red">
+                {t("sync.failed")} {syncStatus.failed ?? 0}
+              </Tag>
+              <Popover trigger="click" placement="bottomRight" content={advancedControls}>
+                <Button icon={<SettingOutlined />}>{t("filters.title")}</Button>
+              </Popover>
+            </Space>
+          </div>
+        </Card>
+        <div className="graph-canvas">
+          {loading && (
+            <div className="graph-loading">
+              <Spin />
+            </div>
+          )}
+          <div ref={containerRef} className="graph-cytoscape" />
+          <div className={`graph-floating-capsule ${!pathSourceId && !pathTargetId ? "is-idle" : ""}`}>
+            <Space size="small" wrap>
               <Text type="secondary">{t("graph.path_context_hint")}</Text>
-              <Button loading={pathLoading} onClick={highlightShortestPath}>
+              <Select
+                allowClear
+                showSearch
+                style={{ width: 210 }}
+                placeholder={t("graph.path_source")}
+                value={pathSourceId}
+                options={pathNodeOptions}
+                onChange={(value) => setPathSourceId(value)}
+              />
+              <Select
+                allowClear
+                showSearch
+                style={{ width: 210 }}
+                placeholder={t("graph.path_target")}
+                value={pathTargetId}
+                options={pathNodeOptions}
+                onChange={(value) => setPathTargetId(value)}
+              />
+              <Button icon={<AimOutlined />} type="primary" loading={pathLoading} onClick={highlightShortestPath}>
                 {t("graph.shortest_path")}
               </Button>
               <Button
+                icon={<DeleteOutlined />}
                 onClick={() => {
                   if (!cyRef.current) return;
                   cyRef.current.nodes().removeClass("path-step");
@@ -1935,1285 +2369,76 @@ export default function GraphView({ t, standalone = false }: GraphViewProps) {
               >
                 {t("graph.clear_shortest_path")}
               </Button>
-            </Space>
-            <Space size="small" wrap>
-              <Tag color="red">{t("legend.ccf")}</Tag>
-              <Tag color="blue">{t("legend.global")}</Tag>
-              <Tag color="green">{t("legend.cnki")}</Tag>
-              <Tag color="default">{t("legend.ref_only")}</Tag>
-              <Tag color="green">{t("graph.intent_build_on")}</Tag>
-              <Tag color="red">{t("graph.intent_contrast")}</Tag>
-              <Tag color="gold">{t("graph.intent_baseline")}</Tag>
-              <Tag color="blue">
-                {t("sync.queued")} {syncStatus.queued ?? 0}
+              <Tag className="soft-tag soft-tag-indigo">
+                {t("graph.path_source")}: {pathSourceId || "-"}
               </Tag>
-              <Tag color="gold">
-                {t("sync.running")} {syncStatus.running ?? 0}
-              </Tag>
-              <Tag color="green">
-                {t("sync.idle")} {syncStatus.idle ?? 0}
-              </Tag>
-              <Tag color="red">
-                {t("sync.failed")} {syncStatus.failed ?? 0}
+              <Tag className="soft-tag soft-tag-violet">
+                {t("graph.path_target")}: {pathTargetId || "-"}
               </Tag>
             </Space>
-          </Space>
-        </Card>
-        <div className="graph-canvas">
-          {loading && (
-            <div className="graph-loading">
-              <Spin />
-            </div>
-          )}
-          <div ref={containerRef} className="graph-cytoscape" />
-        </div>
-        <Card
-          className="graph-card timeline-card"
-          title={t("timeline.title")}
-          size="small"
-        >
-          {bubbleLabel && (
-            <div className="timeline-bubble">
-              <span className="timeline-bubble-label">
-                {isDragging ? t("timeline.preview") : t("timeline.pending")}
-              </span>
-              <span className="timeline-bubble-range">{bubbleLabel}</span>
-            </div>
-          )}
-          <div
-            className={`timeline ${isDragging ? "is-dragging" : ""}`}
-            ref={timelineRef}
-            onMouseDown={handleTimelineMouseDown}
-            onMouseMove={handleTimelineMouseMove}
-            onMouseUp={handleTimelineMouseUp}
-            onMouseLeave={handleTimelineMouseUp}
-          >
-            {timelineData.map((item) => {
-              const isInRange =
-                displayRange && item.year >= displayRange[0] && item.year <= displayRange[1];
-              return (
-                <div
-                  key={item.year}
-                  className={`timeline-item ${isInRange ? "is-selected" : ""} ${
-                    isDragging ? "is-dragging" : ""
-                  }`}
-                  data-year={item.year}
-                >
-                  <div className="timeline-bar" style={{ height: `${10 + item.count * 6}px` }} />
-                  <div className="timeline-year">{item.year}</div>
-                </div>
-              );
-            })}
           </div>
-        </Card>
+          <div className="graph-floating-timeline">
+            {bubbleLabel && (
+              <div className="timeline-bubble">
+                <span className="timeline-bubble-label">
+                  {isDragging ? t("timeline.preview") : t("timeline.pending")}
+                </span>
+                <span className="timeline-bubble-range">{bubbleLabel}</span>
+              </div>
+            )}
+            <Text type="secondary" className="timeline-title">
+              {t("timeline.title")}
+            </Text>
+            <div
+              className={`timeline ${isDragging ? "is-dragging" : ""}`}
+              ref={timelineRef}
+              onMouseDown={handleTimelineMouseDown}
+              onMouseMove={handleTimelineMouseMove}
+              onMouseUp={handleTimelineMouseUp}
+              onMouseLeave={handleTimelineMouseUp}
+            >
+              {timelineData.map((item) => {
+                const isInRange = displayRange && item.year >= displayRange[0] && item.year <= displayRange[1];
+                return (
+                  <div
+                    key={item.year}
+                    className={`timeline-item ${isInRange ? "is-selected" : ""} ${isDragging ? "is-dragging" : ""}`}
+                    data-year={item.year}
+                  >
+                    <div className="timeline-bar" style={{ height: `${10 + item.count * 6}px` }} />
+                    <div className="timeline-year">{item.year}</div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
       </div>
       <div className="graph-inspector">
-        <Card className="graph-card" title={t("details.title")} size="small">
-          {selected ? (
-            <Space direction="vertical" size="small" style={{ width: "100%" }}>
-              <Title level={5} style={{ margin: 0 }}>{shortLabel(selected.label)}</Title>
-              <Text type="secondary">{selected.authors || t("details.unknown_authors")}</Text>
-              <Space size="small" wrap>
-                {selected.year && <Tag>{selected.year}</Tag>}
-                {selected.sub_field && <Tag color="geekblue">{selected.sub_field}</Tag>}
-                {!selected.sub_field && selected.open_sub_field && <Tag color="magenta">{selected.open_sub_field}</Tag>}
-                {selected.ccf_level && <Tag color="red">CCF {selected.ccf_level}</Tag>}
+        <Card className="graph-card graph-inspector-card" size="small">
+          <Tabs
+            size="small"
+            activeKey={inspectorTab}
+            onChange={(key) => setInspectorTab(key as "details" | "chat")}
+            tabBarExtraContent={
+              <Space size={6} className="inspector-reading-toggle">
+                <Text type="secondary">{t("inspector.reading_mode")}</Text>
+                <Switch size="small" checked={readingMode} onChange={setReadingMode} />
               </Space>
-              <Space size="small" wrap>
-                <Button
-                  size="small"
-                  onClick={async () => {
-                    if (!selected) return;
-                    const next = selected.read_status === 1 ? 0 : 1;
-                    const updated = await updatePaper(selected.id, { read_status: next });
-                    setSelected({ ...selected, read_status: updated.read_status ?? next });
-                    fetchData(subField, yearRange);
-                  }}
-                >
-                  {selected.read_status === 1 ? t("details.mark_unread") : t("details.mark_read")}
-                </Button>
-                <Button size="small" onClick={() => addToComparison(selected.id)}>
-                  {t("compare.add")}
-                </Button>
-                <Button size="small" onClick={() => setWorkbenchTab("chat")}>
-                  {t("qa.title")}
-                </Button>
-                <Button size="small" onClick={loadNeighbors}>
-                  {t("details.load_neighbors")}
-                </Button>
-              </Space>
-              <Paragraph ellipsis={{ rows: 3 }} style={{ marginBottom: 0 }}>
-                {selected.abstract || t("details.no_abstract")}
-              </Paragraph>
-            </Space>
-          ) : (
-            <Text type="secondary">{t("details.select_hint")}</Text>
-          )}
-        </Card>
-      </div>
-      <div className="graph-workbench">
-        <Card className="graph-card" title={t("graph.workbench")} size="small">
-          {selected ? (
-            <Space direction="vertical" size="small">
-              <Title level={5}>{selected.label}</Title>
-              <Text type="secondary">{selected.authors || t("details.unknown_authors")}</Text>
-              <Space size="small">
-                {selected.year && <Tag>{selected.year}</Tag>}
-                {selected.sub_field && <Tag color="geekblue">{selected.sub_field}</Tag>}
-                {!selected.sub_field && selected.open_sub_field && (
-                  <Tag color="magenta">{selected.open_sub_field}</Tag>
-                )}
-                {selected.ccf_level && <Tag color="red">CCF {selected.ccf_level}</Tag>}
-              </Space>
-              <div>
-                <Text type="secondary">{t("details.sub_field")}</Text>
-                <Select
-                  allowClear
-                  style={{ width: "100%", marginTop: 6 }}
-                  options={subFieldOptions}
-                  value={selected.sub_field ?? undefined}
-                  onChange={async (value) => {
-                    if (!selected) return;
-                    const updated = await updatePaper(selected.id, { sub_field: value ?? null });
-                    setSelected({ ...selected, sub_field: updated.sub_field ?? null });
-                    message.success(t("msg.subfield_updated"));
-                    await maybeAutoPush(updated.id, selected.zotero_item_key);
-                  }}
-                  placeholder={t("details.sub_field")}
-                />
-              </div>
-              <Paragraph ellipsis={{ rows: 6 }}>
-                {selected.abstract || t("details.no_abstract")}
-              </Paragraph>
-              {selected.summary_one && (
-                <div>
-                  <Text type="secondary">{t("details.summary")}</Text>
-                  <Paragraph type="secondary" ellipsis={{ rows: 2 }}>
-                    {selected.summary_one}
-                  </Paragraph>
-                </div>
-              )}
-              {selected.proposed_method_name && (
-                <Tag color="cyan">{selected.proposed_method_name}</Tag>
-              )}
-              {selected.dynamic_tags && selected.dynamic_tags.length > 0 && (
-                <Space size="small" wrap>
-                  {selected.dynamic_tags.map((tag) => (
-                    <Tag key={`${selected.id}-${tag}`}>{tag}</Tag>
-                  ))}
-                </Space>
-              )}
-              <Space size="small">
-                {selected.citation_count !== null && (
-                  <Tag color="gold">
-                    {t("details.citations")}: {selected.citation_count ?? 0}
-                  </Tag>
-                )}
-                {selected.reference_count !== null && (
-                  <Tag color="purple">
-                    {t("details.references")}: {selected.reference_count ?? 0}
-                  </Tag>
-                )}
-                {typeof selected.open_tasks === "number" && selected.open_tasks > 0 && (
-                  <Tag color="orange">
-                    {t("workspace.tasks")}: {selected.open_tasks}
-                  </Tag>
-                )}
-                {typeof selected.experiment_count === "number" && selected.experiment_count > 0 && (
-                  <Tag color="cyan">
-                    {t("workspace.experiments")}: {selected.experiment_count}
-                  </Tag>
-                )}
-              </Space>
-              <Button
-                onClick={async () => {
-                  if (!selected) return;
-                  const next = selected.read_status === 1 ? 0 : 1;
-                  const updated = await updatePaper(selected.id, { read_status: next });
-                  setSelected({ ...selected, read_status: updated.read_status ?? next });
-                  message.success(next === 1 ? t("msg.mark_read") : t("msg.mark_unread"));
-                  fetchData(subField, yearRange);
-                  await maybeAutoPush(updated.id, selected.zotero_item_key);
-                }}
-              >
-                {selected.read_status === 1 ? t("details.mark_unread") : t("details.mark_read")}
-              </Button>
-              <Button onClick={() => addToComparison(selected.id)}>{t("compare.add")}</Button>
-              <Button
-                onClick={() => {
-                  setPathSourceId(selected.id);
-                }}
-              >
-                {t("compare.set_source")}
-              </Button>
-              <Button
-                onClick={() => {
-                  setPathTargetId(selected.id);
-                }}
-              >
-                {t("compare.set_target")}
-              </Button>
-              <div>
-                <Text type="secondary">{t("details.zotero_key")}</Text>
-                <Input
-                  value={zoteroKey}
-                  onChange={(e) => setZoteroKey(e.target.value)}
-                  placeholder="e.g. ABCD1234"
-                  style={{ marginTop: 6 }}
-                />
-                {selected.zotero_item_id && (
-                  <Text type="secondary" style={{ display: "block", marginTop: 6 }}>
-                    {t("details.zotero_id")}: {selected.zotero_item_id} ({selected.zotero_library ?? "user"})
-                  </Text>
-                )}
-              </div>
-              <Space size="small">
-                <Button
-                  onClick={async () => {
-                    if (!selected) return;
-                    const updated = await updatePaper(selected.id, { zotero_item_key: zoteroKey });
-                    setSelected({
-                      ...selected,
-                      zotero_item_key: updated.zotero_item_key ?? null,
-                      zotero_library: updated.zotero_library ?? null,
-                      zotero_item_id: updated.zotero_item_id ?? null
-                    });
-                    message.success(t("msg.zotero_saved"));
-                    await maybeAutoPush(updated.id, updated.zotero_item_key ?? null);
-                  }}
-                >
-                  {t("details.save")}
-                </Button>
-                <Button
-                  onClick={async () => {
-                    if (!selected) return;
-                    try {
-                      const updated = await matchZotero(selected.id);
-                      setSelected({
-                        ...selected,
-                        zotero_item_key: updated.zotero_item_key ?? null,
-                        zotero_library: updated.zotero_library ?? null,
-                        zotero_item_id: updated.zotero_item_id ?? null
-                      });
-                      setZoteroKey(updated.zotero_item_key ?? "");
-                      message.success(t("msg.zotero_matched"));
-                    } catch (err: any) {
-                      message.error(err?.response?.data?.detail || t("msg.zotero_match_failed"));
-                    }
-                  }}
-                >
-                  {t("details.match")}
-                </Button>
-                <Button
-                  onClick={async () => {
-                    if (!selected) return;
-                    try {
-                      await pushZotero(selected.id);
-                      message.success(t("msg.zotero_pushed"));
-                    } catch (err: any) {
-                      message.error(err?.response?.data?.detail || t("msg.zotero_update_failed"));
-                    }
-                  }}
-                >
-                  {t("details.push")}
-                </Button>
-                <Button onClick={loadNeighbors}>{t("details.load_neighbors")}</Button>
-                <Button
-                  type="primary"
-                  onClick={() => {
-                    if (!selected?.zotero_item_key) {
-                      message.warning(t("msg.zotero_key_required"));
-                      return;
-                    }
-                    const library = selected.zotero_library || "";
-                    let url = `zotero://select/library/items/${selected.zotero_item_key}`;
-                    if (library.startsWith("group:")) {
-                      const groupId = library.split(":")[1];
-                      if (groupId) {
-                        url = `zotero://select/groups/${groupId}/items/${selected.zotero_item_key}`;
-                      }
-                    }
-                    window.location.href = url;
-                  }}
-                >
-                  {t("details.open")}
-                </Button>
-              </Space>
-              <Divider style={{ margin: "10px 0" }} />
-              <Tabs
-                size="small"
-                activeKey={workbenchTab}
-                onChange={(key) =>
-                  setWorkbenchTab(
-                    key as
-                      | "chat"
-                      | "search"
-                      | "notes"
-                      | "schema"
-                      | "tasks"
-                      | "backlinks"
-                      | "experiments"
-                      | "leaderboard"
-                      | "comparison"
-                      | "capsules"
-                      | "jobs"
-                  )
-                }
-                items={[
-                  {
-                    key: "search",
-                    label: t("tab.search"),
-                    children: (
-                      <Space direction="vertical" size="small" style={{ width: "100%" }}>
-                        <Input.Search
-                          value={searchQuery}
-                          onChange={(e) => setSearchQuery(e.target.value)}
-                          placeholder={t("search.placeholder")}
-                          enterButton={t("search.run")}
-                          loading={searchLoading}
-                          onSearch={async (value) => {
-                            const q = value.trim();
-                            if (!q) {
-                              setSearchResults([]);
-                              return;
-                            }
-                            setSearchLoading(true);
-                            try {
-                              const data = await searchPapers(q, 20);
-                              setSearchResults(data.results);
-                            } finally {
-                              setSearchLoading(false);
-                            }
-                          }}
-                        />
-                        <List
-                          size="small"
-                          dataSource={searchResults}
-                          locale={{ emptyText: t("search.empty") }}
-                          renderItem={(item) => (
-                            <List.Item
-                              actions={[
-                                <Button
-                                  key="jump"
-                                  size="small"
-                                  onClick={() => {
-                                    const node = graph?.nodes.find((n) => n.id === item.paper.id);
-                                    if (node) {
-                                      setSelected(node);
-                                      setZoteroKey(node.zotero_item_key || "");
-                                    }
-                                  }}
-                                >
-                                  {t("workspace.schema_select")}
-                                </Button>
-                              ]}
-                            >
-                              <Space direction="vertical" size={0}>
-                                <Text>{item.paper.title || `#${item.paper.id}`}</Text>
-                                <Text type="secondary">
-                                  {item.paper.year || "-"} · {item.paper.sub_field || "-"} · {item.score.toFixed(3)}
-                                </Text>
-                                <Text type="secondary">{item.snippet || ""}</Text>
-                              </Space>
-                            </List.Item>
-                          )}
-                        />
-                      </Space>
-                    )
-                  },
-                  {
-                    key: "notes",
-                    label: t("workspace.notes"),
-                    children: (
-                      <Space direction="vertical" size="small" style={{ width: "100%" }}>
-                        <Input.TextArea
-                          value={note?.method ?? ""}
-                          onChange={(e) =>
-                            setNote((prev) => ({ ...(prev ?? { paper_id: selected.id }), method: e.target.value }))
-                          }
-                          placeholder={t("workspace.method")}
-                          autoSize={{ minRows: 2, maxRows: 4 }}
-                        />
-                        <Input.TextArea
-                          value={note?.datasets ?? ""}
-                          onChange={(e) =>
-                            setNote((prev) => ({ ...(prev ?? { paper_id: selected.id }), datasets: e.target.value }))
-                          }
-                          placeholder={t("workspace.datasets")}
-                          autoSize={{ minRows: 2, maxRows: 4 }}
-                        />
-                        <Input.TextArea
-                          value={note?.conclusions ?? ""}
-                          onChange={(e) =>
-                            setNote((prev) => ({ ...(prev ?? { paper_id: selected.id }), conclusions: e.target.value }))
-                          }
-                          placeholder={t("workspace.conclusion")}
-                          autoSize={{ minRows: 2, maxRows: 4 }}
-                        />
-                        <Input.TextArea
-                          value={note?.reproducibility ?? ""}
-                          onChange={(e) =>
-                            setNote((prev) => ({
-                              ...(prev ?? { paper_id: selected.id }),
-                              reproducibility: e.target.value
-                            }))
-                          }
-                          placeholder={t("workspace.reproducibility")}
-                          autoSize={{ minRows: 2, maxRows: 4 }}
-                        />
-                        <Input.TextArea
-                          value={note?.risks ?? ""}
-                          onChange={(e) =>
-                            setNote((prev) => ({ ...(prev ?? { paper_id: selected.id }), risks: e.target.value }))
-                          }
-                          placeholder={t("workspace.risks")}
-                          autoSize={{ minRows: 2, maxRows: 4 }}
-                        />
-                        <Input.TextArea
-                          value={note?.notes ?? ""}
-                          onChange={(e) =>
-                            setNote((prev) => ({ ...(prev ?? { paper_id: selected.id }), notes: e.target.value }))
-                          }
-                          placeholder={t("workspace.notes_free")}
-                          autoSize={{ minRows: 3, maxRows: 6 }}
-                        />
-                        <Button
-                          type="primary"
-                          loading={noteSaving}
-                          onClick={async () => {
-                            if (!selected || !note) return;
-                            setNoteSaving(true);
-                            try {
-                              const saved = await savePaperNotes(selected.id, {
-                                method: note.method ?? null,
-                                datasets: note.datasets ?? null,
-                                conclusions: note.conclusions ?? null,
-                                reproducibility: note.reproducibility ?? null,
-                                risks: note.risks ?? null,
-                                notes: note.notes ?? null
-                              });
-                              setNote(saved);
-                              const links = await fetchPaperBacklinks(selected.id);
-                              setBacklinks(links);
-                              message.success(t("workspace.notes_saved"));
-                            } finally {
-                              setNoteSaving(false);
-                            }
-                          }}
-                        >
-                          {t("workspace.save_notes")}
-                        </Button>
-                      </Space>
-                    )
-                  },
-                  {
-                    key: "schema",
-                    label: t("workspace.schema_tab"),
-                    children: (
-                      <Space direction="vertical" size="small" style={{ width: "100%" }}>
-                        <Input.Search
-                          value={schemaKeyword}
-                          onChange={(e) => setSchemaKeyword(e.target.value)}
-                          placeholder={t("workspace.schema_search")}
-                          enterButton={t("search.run")}
-                          onSearch={async (value) => {
-                            const keyword = value.trim();
-                            if (!keyword) {
-                              setSchemaSearchResults([]);
-                              return;
-                            }
-                            const res = await searchSchemas(keyword, 30);
-                            setSchemaSearchResults(res.items);
-                          }}
-                        />
-                        <Space size="small" wrap>
-                          <Button
-                            loading={schemaLoading}
-                            onClick={async () => {
-                              if (!selected) return;
-                              setSchemaLoading(true);
-                              try {
-                                const schema = await extractPaperSchema(selected.id, true);
-                                setPaperSchema(schema);
-                                message.success(t("workspace.schema_extract_ok"));
-                              } catch (err: any) {
-                                message.error(err?.response?.data?.detail || t("workspace.schema_extract_fail"));
-                              } finally {
-                                setSchemaLoading(false);
-                              }
-                            }}
-                          >
-                            {t("workspace.schema_extract")}
-                          </Button>
-                          {paperSchema?.confidence != null && (
-                            <Tag color="blue">
-                              {t("workspace.schema_confidence")}: {Number(paperSchema.confidence).toFixed(2)}
-                            </Tag>
-                          )}
-                          {paperSchema?.source && <Tag>{paperSchema.source}</Tag>}
-                          <Button
-                            onClick={async () => {
-                              const res = await alignSchemaOntology(800);
-                              message.success(`aligned ${res.aligned_links}`);
-                              const graphData = await fetchSchemaOntology(2);
-                              setSchemaOntology(graphData);
-                            }}
-                          >
-                            {t("workspace.schema_align")}
-                          </Button>
-                          <Button
-                            onClick={async () => {
-                              const graphData = await fetchSchemaOntology(2);
-                              setSchemaOntology(graphData);
-                            }}
-                          >
-                            {t("workspace.schema_graph")}
-                          </Button>
-                        </Space>
-                        <div>
-                          <Text type="secondary">{t("workspace.schema_event_types")}</Text>
-                          <List
-                            size="small"
-                            dataSource={paperSchema?.event_types || []}
-                            locale={{ emptyText: t("workspace.schema_empty_event_types") }}
-                            renderItem={(item) => (
-                              <List.Item>
-                                <Space direction="vertical" size={0}>
-                                  <Text strong>{item.name}</Text>
-                                  {item.roles && item.roles.length > 0 && (
-                                    <Space size="small" wrap>
-                                      {item.roles.slice(0, 10).map((role) => (
-                                        <Tag key={`${item.name}-${role}`}>{role}</Tag>
-                                      ))}
-                                    </Space>
-                                  )}
-                                </Space>
-                              </List.Item>
-                            )}
-                          />
-                        </div>
-                        <div>
-                          <Text type="secondary">{t("workspace.schema_role_types")}</Text>
-                          <Space size="small" wrap style={{ marginTop: 6 }}>
-                            {(paperSchema?.role_types || []).map((role) => (
-                              <Tag key={`role-${role}`}>{role}</Tag>
-                            ))}
-                          </Space>
-                        </div>
-                        {schemaSearchResults.length > 0 && (
-                          <div>
-                            <Text type="secondary">{t("workspace.schema_matches")}</Text>
-                            <List
-                              size="small"
-                              dataSource={schemaSearchResults}
-                              renderItem={(row) => (
-                                <List.Item
-                                  actions={[
-                                    <Button
-                                      key="select"
-                                      size="small"
-                                      onClick={() => {
-                                        const node = graph?.nodes.find((n) => n.id === row.paper_id);
-                                        if (node) {
-                                          setSelected(node);
-                                          setZoteroKey(node.zotero_item_key || "");
-                                        }
-                                      }}
-                                    >
-                                      {t("workspace.schema_select")}
-                                    </Button>
-                                  ]}
-                                >
-                                  <Space direction="vertical" size={0}>
-                                    <Text>{row.title || `#${row.paper_id}`}</Text>
-                                    <Text type="secondary">
-                                      {row.year || "-"} · {row.sub_field || "-"}
-                                    </Text>
-                                  </Space>
-                                </List.Item>
-                              )}
-                            />
-                          </div>
-                        )}
-                        {schemaOntology && (
-                          <div>
-                            <Text type="secondary">
-                              {t("workspace.schema_ontology")} · {schemaOntology.count}
-                            </Text>
-                            <List
-                              size="small"
-                              dataSource={schemaOntology.nodes.slice(0, 20)}
-                              renderItem={(node) => (
-                                <List.Item>
-                                  <Space direction="vertical" size={0}>
-                                    <Text>{node.name}</Text>
-                                    <Text type="secondary">
-                                      {node.type} · {node.paper_count}
-                                    </Text>
-                                  </Space>
-                                </List.Item>
-                              )}
-                            />
-                          </div>
-                        )}
-                      </Space>
-                    )
-                  },
-                  {
-                    key: "tasks",
-                    label: (
-                      <span>
-                        {t("workspace.tasks")}{" "}
-                        <Badge count={tasks.filter((task) => task.status !== "done").length} />
-                      </span>
-                    ),
-                    children: (
-                      <Space direction="vertical" size="small" style={{ width: "100%" }}>
-                        <Input
-                          value={taskTitle}
-                          onChange={(e) => setTaskTitle(e.target.value)}
-                          placeholder={t("workspace.task_title")}
-                        />
-                        <Input
-                          type="date"
-                          value={taskDueDate || ""}
-                          onChange={(e) => setTaskDueDate(e.target.value || undefined)}
-                        />
-                        <Button
-                          loading={taskLoading}
-                          onClick={async () => {
-                            if (!selected || !taskTitle.trim()) return;
-                            setTaskLoading(true);
-                            try {
-                              await createTask({
-                                paper_id: selected.id,
-                                title: taskTitle.trim(),
-                                due_date: taskDueDate
-                              });
-                              const latest = await fetchTasks({ paper_id: selected.id });
-                              setTasks(latest);
-                              setTaskTitle("");
-                              message.success(t("workspace.task_added"));
-                            } finally {
-                              setTaskLoading(false);
-                            }
-                          }}
-                        >
-                          {t("workspace.add_task")}
-                        </Button>
-                        <List
-                          size="small"
-                          dataSource={tasks}
-                          locale={{ emptyText: t("workspace.no_tasks") }}
-                          renderItem={(item) => (
-                            <List.Item
-                              actions={[
-                                <Button
-                                  key="done"
-                                  size="small"
-                                  onClick={async () => {
-                                    if (item.status === "done") {
-                                      await updateTask(item.id, { status: "todo" });
-                                    } else {
-                                      await completeReview(item.id);
-                                    }
-                                    if (selected) {
-                                      const latest = await fetchTasks({ paper_id: selected.id });
-                                      setTasks(latest);
-                                    }
-                                  }}
-                                >
-                                  {item.status === "done" ? t("workspace.reopen_task") : t("workspace.finish_task")}
-                                </Button>
-                              ]}
-                            >
-                              <Space direction="vertical" size={0}>
-                                <Text>{item.title}</Text>
-                                <Text type="secondary">
-                                  {item.due_date ? `${t("workspace.due")}: ${item.due_date}` : t("workspace.no_due")}
-                                </Text>
-                              </Space>
-                            </List.Item>
-                          )}
-                        />
-                      </Space>
-                    )
-                  },
-                  {
-                    key: "backlinks",
-                    label: t("workspace.backlinks_tab"),
-                    children: (
-                      <Space direction="vertical" size="small" style={{ width: "100%" }}>
-                        <Text type="secondary">{t("workspace.backlinks_hint")}</Text>
-                        <List
-                          size="small"
-                          dataSource={backlinks?.items || []}
-                          locale={{ emptyText: t("workspace.backlinks_empty") }}
-                          renderItem={(item) => (
-                            <List.Item
-                              actions={[
-                                <Button
-                                  key="jump"
-                                  size="small"
-                                  onClick={() => {
-                                    const node = graph?.nodes.find((n) => n.id === item.source_paper_id);
-                                    if (node) {
-                                      setSelected(node);
-                                      setZoteroKey(node.zotero_item_key || "");
-                                    }
-                                  }}
-                                >
-                                  {t("workspace.backlinks_jump")}
-                                </Button>
-                              ]}
-                            >
-                              <Space direction="vertical" size={0}>
-                                <Text>{item.source_title || `#${item.source_paper_id}`}</Text>
-                                <Text type="secondary">
-                                  [[{item.link_text}]] · {item.source_year || "-"} · {item.source_sub_field || "-"}
-                                </Text>
-                              </Space>
-                            </List.Item>
-                          )}
-                        />
-                      </Space>
-                    )
-                  },
-                  {
-                    key: "experiments",
-                    label: t("workspace.experiments"),
-                    children: (
-                      <Space direction="vertical" size="small" style={{ width: "100%" }}>
-                        <Input
-                          value={expName}
-                          onChange={(e) => setExpName(e.target.value)}
-                          placeholder={t("workspace.exp_name")}
-                        />
-                        <Input
-                          value={expModel}
-                          onChange={(e) => setExpModel(e.target.value)}
-                          placeholder={t("workspace.exp_model")}
-                        />
-                        <Input.TextArea
-                          value={expMetrics}
-                          onChange={(e) => setExpMetrics(e.target.value)}
-                          placeholder={t("workspace.exp_metrics")}
-                          autoSize={{ minRows: 2, maxRows: 4 }}
-                        />
-                        <Space size="small" style={{ width: "100%" }} wrap>
-                          <Input
-                            value={expDataset}
-                            onChange={(e) => setExpDataset(e.target.value)}
-                            placeholder={t("workspace.exp_dataset")}
-                            style={{ width: 150 }}
-                          />
-                          <Input
-                            value={expSplit}
-                            onChange={(e) => setExpSplit(e.target.value)}
-                            placeholder={t("workspace.exp_split")}
-                            style={{ width: 120 }}
-                          />
-                          <Input
-                            value={expMetricName}
-                            onChange={(e) => setExpMetricName(e.target.value)}
-                            placeholder={t("workspace.exp_metric_name")}
-                            style={{ width: 120 }}
-                          />
-                          <InputNumber
-                            value={expMetricValue}
-                            onChange={(value) => setExpMetricValue(value ?? undefined)}
-                            min={0}
-                            max={100}
-                            step={0.1}
-                            placeholder={t("workspace.exp_metric_value")}
-                            style={{ width: 110 }}
-                          />
-                          <Switch checked={expIsSota} onChange={setExpIsSota} />
-                          <Text type="secondary">{t("workspace.exp_sota")}</Text>
-                        </Space>
-                        <Button
-                          loading={experimentLoading}
-                          onClick={async () => {
-                            if (!selected || !expName.trim()) return;
-                            setExperimentLoading(true);
-                            try {
-                              await createExperiment({
-                                paper_id: selected.id,
-                                name: expName.trim(),
-                                model: expModel.trim() || undefined,
-                                metrics_json: expMetrics.trim() || undefined,
-                                dataset: expDataset.trim() || undefined,
-                                split: expSplit.trim() || undefined,
-                                metric_name: expMetricName.trim() || undefined,
-                                metric_value: expMetricValue,
-                                is_sota: expIsSota ? 1 : 0
-                              });
-                              const latest = await fetchExperiments({ paper_id: selected.id });
-                              setExperiments(latest);
-                              setExpName("");
-                              setExpModel("");
-                              setExpMetrics("");
-                              setExpDataset("");
-                              setExpSplit("");
-                              setExpMetricName("F1");
-                              setExpMetricValue(undefined);
-                              setExpIsSota(false);
-                              message.success(t("workspace.exp_added"));
-                            } finally {
-                              setExperimentLoading(false);
-                            }
-                          }}
-                        >
-                          {t("workspace.add_experiment")}
-                        </Button>
-                        <List
-                          size="small"
-                          dataSource={experiments}
-                          locale={{ emptyText: t("workspace.no_experiments") }}
-                          renderItem={(item) => (
-                            <List.Item
-                              actions={[
-                                <Button
-                                  key="delete"
-                                  type="link"
-                                  danger
-                                  onClick={async () => {
-                                    await deleteExperiment(item.id);
-                                    if (selected) {
-                                      const latest = await fetchExperiments({ paper_id: selected.id });
-                                      setExperiments(latest);
-                                    }
-                                  }}
-                                >
-                                  {t("manage.delete")}
-                                </Button>
-                              ]}
-                            >
-                              <Space direction="vertical" size={0}>
-                                <Text>{item.name || "-"}</Text>
-                                <Text type="secondary">{item.model || "-"}</Text>
-                                {item.metric_name && (
-                                  <Text type="secondary">
-                                    {item.dataset || item.dataset_name || "-"} / {item.split || "-"} · {item.metric_name}
-                                    {item.metric_value != null ? `=${item.metric_value}` : ""}
-                                    {item.is_sota ? " · SOTA" : ""}
-                                  </Text>
-                                )}
-                                {item.metrics_json && <Text type="secondary">{item.metrics_json}</Text>}
-                              </Space>
-                            </List.Item>
-                          )}
-                        />
-                      </Space>
-                    )
-                  },
-                  {
-                    key: "leaderboard",
-                    label: t("workspace.leaderboard_tab"),
-                    children: (
-                      <Space direction="vertical" size="small" style={{ width: "100%" }}>
-                        <Space size="small" wrap>
-                          <Select
-                            value={metricType}
-                            onChange={(value) =>
-                              setMetricType(
-                                value as "f1" | "precision" | "recall" | "trigger_f1" | "argument_f1"
-                              )
-                            }
-                            options={[
-                              { label: "F1", value: "f1" },
-                              { label: "Precision", value: "precision" },
-                              { label: "Recall", value: "recall" },
-                              { label: "Trigger F1", value: "trigger_f1" },
-                              { label: "Argument F1", value: "argument_f1" }
-                            ]}
-                            style={{ width: 140 }}
-                          />
-                          <Button
-                            onClick={async () => {
-                              const data = await fetchMetricLeaderboard({ metric: metricType, limit: 30 });
-                              setMetricLeaderboard(data);
-                              if (selected) {
-                                const prov = await fetchMetricProvenance({ paper_id: selected.id, limit: 80 });
-                                setMetricProvenance(prov);
-                              }
-                            }}
-                          >
-                            {t("btn.refresh")}
-                          </Button>
-                        </Space>
-                        <List
-                          size="small"
-                          dataSource={metricLeaderboard?.top_items || []}
-                          locale={{ emptyText: t("workspace.leaderboard_empty") }}
-                          renderItem={(item, idx) => (
-                            <List.Item>
-                              <Space direction="vertical" size={0}>
-                                <Text>
-                                  #{idx + 1} {item.title || `#${item.paper_id}`}
-                                </Text>
-                                <Text type="secondary">
-                                  {item.dataset_name || "-"} · {item.metric_value ?? "-"} · {item.year || "-"}
-                                </Text>
-                                {(item.table_id || item.cell_text) && (
-                                  <Text type="secondary">
-                                    {item.table_id || "-"} r{item.row_index ?? "-"} c{item.col_index ?? "-"} · {item.cell_text || "-"}
-                                  </Text>
-                                )}
-                              </Space>
-                            </List.Item>
-                          )}
-                        />
-                        <List
-                          size="small"
-                          header={<Text type="secondary">{t("workspace.metric_provenance")}</Text>}
-                          dataSource={metricProvenance?.items || []}
-                          locale={{ emptyText: "-" }}
-                          renderItem={(item) => (
-                            <List.Item>
-                              <Text type="secondary">
-                                {item.metric_key}={item.metric_value} · {item.dataset_name} · {item.table_id} r{item.row_index}c{item.col_index}
-                              </Text>
-                            </List.Item>
-                          )}
-                        />
-                      </Space>
-                    )
-                  },
-                  {
-                    key: "comparison",
-                    label: t("compare.title"),
-                    children: (
-                      <Space direction="vertical" size="small" style={{ width: "100%" }}>
-                        <Space size="small" wrap>
-                          {compareQueue.map((paperId) => (
-                            <Tag
-                              key={paperId}
-                              closable
-                              onClose={(e) => {
-                                e.preventDefault();
-                                removeFromComparison(paperId);
-                              }}
-                            >
-                              #{paperId}
-                            </Tag>
-                          ))}
-                        </Space>
-                        <Button onClick={runComparison} loading={compareLoading}>
-                          {t("compare.refresh")}
-                        </Button>
-                        <List
-                          size="small"
-                          loading={compareLoading}
-                          dataSource={compareData?.items || []}
-                          locale={{ emptyText: t("compare.empty") }}
-                          renderItem={(item) => (
-                            <List.Item>
-                              <Space direction="vertical" size={0} style={{ width: "100%" }}>
-                                <Text strong>{item.paper.title || "-"}</Text>
-                                <Text type="secondary">
-                                  {item.metrics
-                                    .slice(0, 2)
-                                    .map((m) => `${m.dataset_name || "-"} F1:${m.f1 ?? m.argument_f1 ?? m.trigger_f1 ?? "-"}`)
-                                    .join(" | ")}
-                                </Text>
-                                <Space size="small" wrap>
-                                  {item.tags.slice(0, 4).map((tag) => (
-                                    <Tag key={`${item.paper.id}-${tag}`}>{tag}</Tag>
-                                  ))}
-                                </Space>
-                              </Space>
-                            </List.Item>
-                          )}
-                        />
-                      </Space>
-                    )
-                  },
-                  {
-                    key: "chat",
-                    label: t("qa.title"),
-                    children: (
-                      <Space direction="vertical" size="small" style={{ width: "100%" }}>
-                        <Space size="small" wrap>
-                          <Select
-                            allowClear
-                            style={{ width: 200 }}
-                            value={chatSessionId}
-                            placeholder={t("qa.session")}
-                            options={chatSessions.map((session) => ({
-                              label: `#${session.id} ${session.title || ""}`.trim(),
-                              value: session.id
-                            }))}
-                            onChange={(value) => setChatSessionId(value)}
-                          />
-                          <Button
-                            onClick={async () => {
-                              const session = await createChatSession({ title: qaQuery.slice(0, 30), language: "zh" });
-                              setChatSessionId(session.id);
-                              await refreshChatSessions();
-                            }}
-                          >
-                            {t("qa.new_session")}
-                          </Button>
-                        </Space>
-                        <Select
-                          value={qaMode}
-                          onChange={(value) => setQaMode(value as "single" | "compare")}
-                          options={[
-                            { label: t("qa.single"), value: "single" },
-                            { label: t("qa.multi"), value: "compare" }
-                          ]}
-                        />
-                        <Input.TextArea
-                          value={qaQuery}
-                          onChange={(e) => setQaQuery(e.target.value)}
-                          placeholder={t("qa.placeholder")}
-                          autoSize={{ minRows: 2, maxRows: 4 }}
-                        />
-                        <Button type="primary" onClick={askPaperQa} loading={qaLoading}>
-                          {t("qa.ask")}
-                        </Button>
-                        <List
-                          size="small"
-                          dataSource={chatHistory.slice(-6)}
-                          locale={{ emptyText: t("qa.history_empty") }}
-                          renderItem={(msg) => (
-                            <List.Item>
-                              <Space direction="vertical" size={0}>
-                                <Text strong>{msg.role === "assistant" ? "AI" : "You"}</Text>
-                                <Text type="secondary">{msg.content.slice(0, 200)}</Text>
-                              </Space>
-                            </List.Item>
-                          )}
-                        />
-                        {qaResult && (
-                          <>
-                            <Paragraph style={{ whiteSpace: "pre-wrap" }}>{qaResult.answer}</Paragraph>
-                            {typeof qaResult.trace_score === "number" && (
-                              <Tag color={qaResult.trace_score >= 0.6 ? "green" : qaResult.trace_score >= 0.4 ? "gold" : "red"}>
-                                Traceability: {qaResult.trace_score.toFixed(2)}
-                              </Tag>
-                            )}
-                            <List
-                              size="small"
-                              header={<Text type="secondary">{t("qa.sources")}</Text>}
-                              dataSource={qaResult.sources}
-                              renderItem={(source) => (
-                                <List.Item>
-                                  <Text type="secondary">
-                                    #{source.paper_id} {source.title} {source.chunk_index !== undefined ? ` [chunk ${source.chunk_index}]` : ""}
-                                  </Text>
-                                </List.Item>
-                              )}
-                            />
-                          </>
-                        )}
-                      </Space>
-                    )
-                  },
-                  {
-                    key: "capsules",
-                    label: t("workspace.capsules"),
-                    children: (
-                      <Space direction="vertical" size="small" style={{ width: "100%" }}>
-                        <Input
-                          value={capsuleTitle}
-                          onChange={(e) => setCapsuleTitle(e.target.value)}
-                          placeholder={t("workspace.capsule_title")}
-                        />
-                        <Input.TextArea
-                          value={capsuleContent}
-                          onChange={(e) => setCapsuleContent(e.target.value)}
-                          placeholder={t("workspace.capsule_content")}
-                          autoSize={{ minRows: 3, maxRows: 6 }}
-                        />
-                        <Space size="small" wrap>
-                          <Select
-                            value={capsuleStatus}
-                            style={{ width: 140 }}
-                            onChange={(value) =>
-                              setCapsuleStatus(value as "seed" | "incubating" | "validated" | "archived")
-                            }
-                            options={[
-                              { label: "seed", value: "seed" },
-                              { label: "incubating", value: "incubating" },
-                              { label: "validated", value: "validated" },
-                              { label: "archived", value: "archived" }
-                            ]}
-                          />
-                          <InputNumber min={1} max={5} value={capsulePriority} onChange={(value) => setCapsulePriority(value || 2)} />
-                          <Input
-                            value={capsuleTags}
-                            onChange={(e) => setCapsuleTags(e.target.value)}
-                            placeholder={t("workspace.capsule_tags")}
-                            style={{ width: 220 }}
-                          />
-                          <Button
-                            type="primary"
-                            loading={capsuleLoading}
-                            onClick={async () => {
-                              if (!capsuleTitle.trim() || !capsuleContent.trim()) return;
-                              setCapsuleLoading(true);
-                              try {
-                                await createIdeaCapsule({
-                                  title: capsuleTitle.trim(),
-                                  content: capsuleContent.trim(),
-                                  status: capsuleStatus,
-                                  priority: capsulePriority,
-                                  linked_papers: selected ? [selected.id] : [],
-                                  tags: capsuleTags
-                                    .split(",")
-                                    .map((item) => item.trim())
-                                    .filter(Boolean)
-                                });
-                                setCapsuleTitle("");
-                                setCapsuleContent("");
-                                setCapsuleTags("");
-                                await refreshCapsules();
-                                message.success(t("workspace.capsule_saved"));
-                              } finally {
-                                setCapsuleLoading(false);
-                              }
-                            }}
-                          >
-                            {t("workspace.capsule_add")}
-                          </Button>
-                        </Space>
-                        <List
-                          size="small"
-                          dataSource={capsules}
-                          locale={{ emptyText: t("workspace.capsule_empty") }}
-                          renderItem={(item) => (
-                            <List.Item
-                              actions={[
-                                <Button
-                                  key="promote"
-                                  size="small"
-                                  onClick={async () => {
-                                    const next =
-                                      item.status === "seed"
-                                        ? "incubating"
-                                        : item.status === "incubating"
-                                          ? "validated"
-                                          : item.status === "validated"
-                                            ? "archived"
-                                            : "archived";
-                                    await updateIdeaCapsule(item.id, { status: next });
-                                    await refreshCapsules();
-                                  }}
-                                >
-                                  {t("workspace.capsule_promote")}
-                                </Button>,
-                                <Button
-                                  key="delete"
-                                  danger
-                                  type="link"
-                                  onClick={async () => {
-                                    await deleteIdeaCapsule(item.id);
-                                    await refreshCapsules();
-                                  }}
-                                >
-                                  {t("manage.delete")}
-                                </Button>
-                              ]}
-                            >
-                              <Space direction="vertical" size={0}>
-                                <Text>{item.title}</Text>
-                                <Text type="secondary">
-                                  {item.status} · p{item.priority} · {(item.linked_papers || []).join(",")}
-                                </Text>
-                              </Space>
-                            </List.Item>
-                          )}
-                        />
-                      </Space>
-                    )
-                  },
-                  {
-                    key: "jobs",
-                    label: t("workspace.jobs"),
-                    children: (
-                      <Space direction="vertical" size="small" style={{ width: "100%" }}>
-                        <Space size="small" wrap>
-                          <Button onClick={refreshJobBoard} loading={jobLoading}>
-                            {t("btn.refresh")}
-                          </Button>
-                          <Button
-                            onClick={async () => {
-                              const res = await runQueuedJobs(5);
-                              message.success(`run ${res.executed}`);
-                              await refreshJobBoard();
-                            }}
-                          >
-                            {t("workspace.jobs_run")}
-                          </Button>
-                          <Tag color={syncStatus.alerts_open ? "red" : "green"}>
-                            alerts: {syncStatus.alerts_open ?? 0}
-                          </Tag>
-                        </Space>
-                        <List
-                          size="small"
-                          header={t("workspace.jobs_history")}
-                          dataSource={jobRuns.slice(0, 20)}
-                          renderItem={(item) => (
-                            <List.Item
-                              actions={[
-                                item.status === "failed" ? (
-                                  <Button
-                                    key="retry"
-                                    size="small"
-                                    onClick={async () => {
-                                      await retryJob(item.id);
-                                      await refreshJobBoard();
-                                    }}
-                                  >
-                                    {t("workspace.jobs_retry")}
-                                  </Button>
-                                ) : null
-                              ]}
-                            >
-                              <Space direction="vertical" size={0}>
-                                <Text>{item.job_type}</Text>
-                                <Text type="secondary">
-                                  #{item.id} · {item.status} · {item.error || "-"}
-                                </Text>
-                              </Space>
-                            </List.Item>
-                          )}
-                        />
-                        <List
-                          size="small"
-                          header={t("workspace.jobs_alerts")}
-                          dataSource={jobAlerts.slice(0, 20)}
-                          locale={{ emptyText: "-" }}
-                          renderItem={(item) => (
-                            <List.Item
-                              actions={[
-                                <Button
-                                  key="resolve"
-                                  size="small"
-                                  onClick={async () => {
-                                    await resolveJobAlert(item.id);
-                                    await refreshJobBoard();
-                                  }}
-                                >
-                                  {t("workspace.jobs_resolve")}
-                                </Button>
-                              ]}
-                            >
-                              <Text type="secondary">#{item.source_job_id} {item.message}</Text>
-                            </List.Item>
-                          )}
-                        />
-                      </Space>
-                    )
-                  }
-                ]}
-              />
-            </Space>
-          ) : (
-            <Text type="secondary">{t("details.select_hint")}</Text>
-          )}
+            }
+            items={[
+              {
+                key: "details",
+                label: t("details.title"),
+                children: detailsPanel
+              },
+              {
+                key: "chat",
+                label: t("qa.title"),
+                children: chatPanel
+              }
+            ]}
+          />
         </Card>
       </div>
       {menu.visible && menu.node && (
